@@ -1,0 +1,23 @@
+{
+  "env": {
+    "CLAUDE_CODE_USE_BEDROCK": "false"
+  },
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:plachtaa.github.io)",
+      "Bash(node:*)",
+      "Bash(npm create:*)",
+      "Bash(cp:*)",
+      "Bash(npm install:*)",
+      "Bash(npx tauri:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(mkdir:*)",
+      "Bash(grep:*)"
+    ],
+    "deny": []
+  },
+  "model": "claude-opus-4-6"
+}
