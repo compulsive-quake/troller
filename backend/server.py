@@ -59,34 +59,70 @@ async def status():
 
 @app.post("/api/setup")
 async def setup_seed_vc():
-    """Clone seed-vc repo if not present."""
+    """Clone seed-vc repo and install deps, streaming progress via SSE."""
+    from starlette.responses import StreamingResponse
+
     if SEED_VC_DIR.exists():
         return {"status": "already_installed", "path": str(SEED_VC_DIR)}
 
-    process = await asyncio.create_subprocess_exec(
-        "git", "clone", "https://github.com/Plachtaa/seed-vc.git", str(SEED_VC_DIR),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Failed to clone: {stderr.decode()}"},
-        )
-
-    # Install seed-vc dependencies
-    req_file = SEED_VC_DIR / "requirements.txt"
-    if req_file.exists():
+    async def stream_setup():
+        # Step 1: Clone
+        yield f"data: Cloning seed-vc repository...\n\n"
         process = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "pip", "install", "-r", str(req_file),
+            "git", "clone", "--progress", "https://github.com/Plachtaa/seed-vc.git", str(SEED_VC_DIR),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await process.communicate()
+        # git clone writes progress to stderr
+        async def read_lines(stream):
+            buf = b""
+            while True:
+                chunk = await stream.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf or b"\r" in buf:
+                    idx_n = buf.find(b"\n")
+                    idx_r = buf.find(b"\r")
+                    if idx_n == -1:
+                        idx = idx_r
+                    elif idx_r == -1:
+                        idx = idx_n
+                    else:
+                        idx = min(idx_n, idx_r)
+                    line = buf[:idx].decode(errors="replace").strip()
+                    buf = buf[idx + 1:]
+                    if line:
+                        yield line
 
-    return {"status": "installed", "path": str(SEED_VC_DIR)}
+        async for line in read_lines(process.stderr):
+            yield f"data: {line}\n\n"
+
+        await process.wait()
+        if process.returncode != 0:
+            yield f"data: ERROR: Failed to clone seed-vc (exit code {process.returncode})\n\n"
+            return
+
+        yield f"data: Clone complete. Installing dependencies...\n\n"
+
+        # Step 2: Install pip deps
+        req_file = SEED_VC_DIR / "requirements.txt"
+        if req_file.exists():
+            pip_proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "pip", "install", "--user", "-r", str(req_file),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            async for line in read_lines(pip_proc.stdout):
+                yield f"data: {line}\n\n"
+            await pip_proc.wait()
+            if pip_proc.returncode != 0:
+                yield f"data: ERROR: pip install failed (exit code {pip_proc.returncode})\n\n"
+                return
+
+        yield f"data: DONE\n\n"
+
+    return StreamingResponse(stream_setup(), media_type="text/event-stream")
 
 
 @app.get("/api/models")

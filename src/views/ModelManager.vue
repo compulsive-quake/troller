@@ -159,6 +159,10 @@ onMounted(() => {
   align-items: flex-end;
 }
 
+.upload-row .form-group {
+  margin-bottom: 0;
+}
+
 .file-upload input[type="file"] {
   display: none;
 }
@@ -181,7 +185,6 @@ onMounted(() => {
 
 .upload-btn {
   white-space: nowrap;
-  margin-bottom: 16px;
 }
 
 .empty-state {

@@ -17,9 +17,16 @@ fn start_backend(state: tauri::State<'_, Mutex<BackendState>>) -> Result<String,
         return Ok("Backend already running".into());
     }
 
+    // Resolve project root: in dev the CWD is src-tauri/, in prod use the exe's parent
+    let project_root = std::env::current_dir()
+        .unwrap()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+
     let child = std::process::Command::new("python")
         .args(["-m", "uvicorn", "backend.server:app", "--host", "127.0.0.1", "--port", "8765"])
-        .current_dir(std::env::current_dir().unwrap().parent().unwrap_or(&std::env::current_dir().unwrap()))
+        .current_dir(&project_root)
         .spawn()
         .map_err(|e| format!("Failed to start backend: {}", e))?;
 
