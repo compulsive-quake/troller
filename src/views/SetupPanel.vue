@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, onMounted, watch, nextTick } from "vue";
 
 defineProps<{ backendReady: boolean }>();
 
@@ -7,6 +7,13 @@ const seedVcInstalled = ref(false);
 const installing = ref(false);
 const installLog = ref("");
 const statusInfo = ref<any>(null);
+const logEl = ref<HTMLElement | null>(null);
+
+watch(installLog, () => {
+  nextTick(() => {
+    if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight;
+  });
+});
 
 const cudaAvailable = ref(false);
 const cudaEnabled = ref(false);
@@ -110,19 +117,49 @@ function formatBytes(bytes: number): string {
 
 async function installSeedVC() {
   installing.value = true;
-  installLog.value = "Cloning seed-vc repository and installing dependencies...";
+  installLog.value = "";
 
   try {
     const resp = await fetch("http://127.0.0.1:8765/api/setup", { method: "POST" });
-    const data = await resp.json();
-    if (resp.ok) {
-      installLog.value = `seed-vc installed at: ${data.path}`;
-      seedVcInstalled.value = true;
-    } else {
-      installLog.value = `Error: ${data.error}`;
+
+    // Check if it's a JSON response (already installed)
+    const contentType = resp.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const data = await resp.json();
+      installLog.value = data.status === "already_installed"
+        ? `seed-vc already installed at: ${data.path}`
+        : `Error: ${data.error || "Unknown error"}`;
+      await checkStatus();
+      return;
     }
+
+    // Stream SSE progress
+    const reader = resp.body!.getReader();
+    const decoder = new TextDecoder();
+    let done = false;
+    while (!done) {
+      const { value, done: streamDone } = await reader.read();
+      done = streamDone;
+      if (value) {
+        const text = decoder.decode(value, { stream: true });
+        for (const line of text.split("\n")) {
+          if (line.startsWith("data: ")) {
+            const msg = line.slice(6);
+            if (msg === "DONE") {
+              installLog.value += "\nInstallation complete!";
+              seedVcInstalled.value = true;
+            } else if (msg.startsWith("ERROR:")) {
+              installLog.value += "\n" + msg;
+            } else {
+              installLog.value += msg + "\n";
+            }
+          }
+        }
+      }
+    }
+    await checkStatus();
   } catch (e: any) {
-    installLog.value = `Error: ${e.message}`;
+    installLog.value += `\nError: ${e.message}`;
   } finally {
     installing.value = false;
   }
@@ -254,7 +291,7 @@ onMounted(() => {
       </button>
       <div v-else class="installed-badge">Installed</div>
 
-      <div v-if="installLog" class="install-log">{{ installLog }}</div>
+      <div v-if="installLog" ref="logEl" class="install-log">{{ installLog }}</div>
     </div>
 
     <div class="card">
@@ -336,6 +373,8 @@ onMounted(() => {
   font-size: 13px;
   color: var(--text-secondary);
   white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
 }
 
 .about-info {

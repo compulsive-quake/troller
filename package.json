@@ -8,7 +8,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "setup": "pip install -r backend/requirements.txt && pip install \"huggingface_hub[hf_xet]\""
+    "setup": "pip install --user -r backend/requirements.txt && pip install --user \"huggingface_hub[hf_xet]\" munch einops descript-audio-codec"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
