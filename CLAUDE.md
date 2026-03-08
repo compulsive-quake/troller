@@ -5,11 +5,9 @@ Real-time voice changer desktop app powered by seed-vc.
 ## Environment
 
 - Platform: Windows 11
-- Region: us-west-1
 - Models: Opus 4.6
 
 ## Tech Stack
-
 - **Frontend**: Vue 3 + TypeScript
 - **Desktop Shell**: Tauri v2 (Rust)
 - **Backend**: Python FastAPI server (port 8765)

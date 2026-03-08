@@ -8,6 +8,8 @@ import TrainingPanel from "./views/TrainingPanel.vue";
 import ModelManager from "./views/ModelManager.vue";
 import SetupPanel from "./views/SetupPanel.vue";
 import TextToSpeech from "./views/TextToSpeech.vue";
+import PrerequisitesPanel from "./views/PrerequisitesPanel.vue";
+import AudioCropper from "./views/AudioCropper.vue";
 
 const currentView = ref("realtime");
 const backendStatus = ref<"stopped" | "starting" | "running" | "error">("stopped");
@@ -31,10 +33,27 @@ async function checkBackend() {
     const resp = await fetch("http://127.0.0.1:8765/api/status");
     if (resp.ok) {
       backendStatus.value = "running";
+      await checkPrerequisites();
     }
   } catch {
     backendStatus.value = "error";
     backendMessage.value = "Backend not responding";
+  }
+}
+
+async function checkPrerequisites() {
+  try {
+    const resp = await fetch("http://127.0.0.1:8765/api/prerequisites");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const hasMissing = data.prerequisites.some(
+      (p: any) => !p.installed && !p.optional
+    );
+    if (hasMissing) {
+      currentView.value = "prerequisites";
+    }
+  } catch {
+    /* ignore - backend may not be ready yet */
   }
 }
 
@@ -64,9 +83,11 @@ onMounted(() => {
       <RealTimeVC v-if="currentView === 'realtime'" :backend-ready="backendStatus === 'running'" />
       <VoiceConvert v-else-if="currentView === 'convert'" :backend-ready="backendStatus === 'running'" />
       <TextToSpeech v-else-if="currentView === 'tts'" :backend-ready="backendStatus === 'running'" />
+      <AudioCropper v-else-if="currentView === 'cropper'" :backend-ready="backendStatus === 'running'" />
       <TrainingPanel v-else-if="currentView === 'training'" :backend-ready="backendStatus === 'running'" />
       <ModelManager v-else-if="currentView === 'models'" :backend-ready="backendStatus === 'running'" />
       <SetupPanel v-else-if="currentView === 'setup'" :backend-ready="backendStatus === 'running'" />
+      <PrerequisitesPanel v-else-if="currentView === 'prerequisites'" :backend-ready="backendStatus === 'running'" />
     </main>
   </div>
 </template>

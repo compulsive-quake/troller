@@ -17,14 +17,36 @@ const audioDevices = ref<{ input: MediaDeviceInfo[]; output: MediaDeviceInfo[] }
 const inputLevel = ref(0);
 const outputLevel = ref(0);
 
+const deviceType = ref("");  // "cuda" or "cpu"
+const deviceName = ref("");
+const gpuStats = ref<{
+  available: boolean;
+  utilization: number;
+  temperature: number;
+  memory_used_mb: number;
+  memory_total_mb: number;
+  name: string;
+  power_draw_w: number | null;
+  power_limit_w: number | null;
+} | null>(null);
+
 let ws: WebSocket | null = null;
 let audioContext: AudioContext | null = null;
 let mediaStream: MediaStream | null = null;
 let processorNode: ScriptProcessorNode | null = null;
 let inputAnalyser: AnalyserNode | null = null;
 let meterRafId: number | null = null;
-let nextPlayTime = 0;
 let chunkSendTime = 0;
+let gpuPollInterval: ReturnType<typeof setInterval> | null = null;
+
+// Ring buffer for glitch-free output playback
+const RING_SIZE = 32000; // 2 seconds at 16kHz
+const PREBUFFER_SAMPLES = 4096; // buffer 1 chunk (~256ms) before starting playback
+let outputRing = new Float32Array(RING_SIZE);
+let ringWritePos = 0;
+let ringReadPos = 0;
+let ringBuffered = 0;
+let prebufferDone = false;
 
 async function loadDevices() {
   try {
@@ -74,7 +96,6 @@ async function startVoiceChanger() {
     const sampleRate = 16000;
     audioContext = new AudioContext({ sampleRate });
     await audioContext.resume();
-    nextPlayTime = 0;
 
     // Route output to selected device if supported
     if (outputDevice.value && "setSinkId" in audioContext) {
@@ -112,6 +133,9 @@ async function startVoiceChanger() {
       if (typeof event.data === "string") {
         const msg = JSON.parse(event.data);
         if (msg.status === "ready") {
+          deviceType.value = msg.device || "";
+          deviceName.value = msg.device_name || "";
+          if (msg.device === "cuda") startGpuPolling();
           startAudioCapture(sampleRate);
         } else if (msg.error) {
           console.error("WS error:", msg.error);
@@ -124,7 +148,7 @@ async function startVoiceChanger() {
         }
         const arrayBuffer = await event.data.arrayBuffer();
         const float32 = new Float32Array(arrayBuffer);
-        playAudio(float32, sampleRate);
+        playAudio(float32);
       }
     };
 
@@ -157,6 +181,34 @@ function startAudioCapture(_sampleRate: number) {
   source.connect(inputAnalyser);
 
   processorNode.onaudioprocess = (e) => {
+    // --- Output: pull from ring buffer for glitch-free playback ---
+    const output = e.outputBuffer.getChannelData(0);
+    const vol = volume.value / 100;
+
+    if (prebufferDone || ringBuffered >= PREBUFFER_SAMPLES) {
+      prebufferDone = true;
+      let peak = 0;
+      for (let i = 0; i < output.length; i++) {
+        if (ringBuffered > 0) {
+          // Soft-clip to [-1, 1] to prevent hard clipping distortion
+          const raw = outputRing[ringReadPos] * vol;
+          const s = Math.max(-1, Math.min(1, raw));
+          output[i] = s;
+          const a = Math.abs(s);
+          if (a > peak) peak = a;
+          ringReadPos = (ringReadPos + 1) % RING_SIZE;
+          ringBuffered--;
+        } else {
+          output[i] = 0; // underrun — silence instead of click
+        }
+      }
+      outputLevel.value = Math.min(100, Math.round(peak * 100));
+    } else {
+      // Still pre-buffering, output silence
+      output.fill(0);
+    }
+
+    // --- Input: send mic audio to backend ---
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const inputData = e.inputBuffer.getChannelData(0);
     chunkSendTime = performance.now();
@@ -164,8 +216,7 @@ function startAudioCapture(_sampleRate: number) {
   };
 
   source.connect(processorNode);
-  // Connect to destination so the ScriptProcessor runs (required by spec),
-  // but it outputs silence — actual playback happens in playAudio()
+  // Connected to destination — output comes from the ring buffer above
   processorNode.connect(audioContext.destination);
 
   // Start meter animation loop
@@ -190,37 +241,27 @@ function startMeterLoop() {
   tick();
 }
 
-function playAudio(float32Data: Float32Array, sampleRate: number) {
-  if (!audioContext) return;
-  const buffer = audioContext.createBuffer(1, float32Data.length, sampleRate);
-  buffer.copyToChannel(float32Data, 0);
-  const source = audioContext.createBufferSource();
-  source.buffer = buffer;
-
-  const gainNode = audioContext.createGain();
-  gainNode.gain.value = volume.value / 100;
-  source.connect(gainNode);
-  gainNode.connect(audioContext.destination);
-
-  // Schedule chunks back-to-back to avoid gaps and overlaps
-  const now = audioContext.currentTime;
-  if (nextPlayTime < now) {
-    nextPlayTime = now;
-  }
-  source.start(nextPlayTime);
-  nextPlayTime += buffer.duration;
-
-  // Compute output level from the buffer
-  let peak = 0;
+function playAudio(float32Data: Float32Array) {
+  // Write incoming audio to ring buffer — the ScriptProcessor output pulls from here
   for (let i = 0; i < float32Data.length; i++) {
-    const v = Math.abs(float32Data[i]);
-    if (v > peak) peak = v;
+    outputRing[ringWritePos] = float32Data[i];
+    ringWritePos = (ringWritePos + 1) % RING_SIZE;
   }
-  outputLevel.value = Math.min(100, Math.round(peak * 100 * (volume.value / 100)));
+  ringBuffered += float32Data.length;
+
+  // Prevent overflow: if writer laps reader, advance reader to avoid stale audio
+  if (ringBuffered > RING_SIZE) {
+    const overflow = ringBuffered - RING_SIZE;
+    ringReadPos = (ringReadPos + overflow) % RING_SIZE;
+    ringBuffered = RING_SIZE;
+  }
 }
 
 function stopVoiceChanger() {
   isActive.value = false;
+  stopGpuPolling();
+  deviceType.value = "";
+  deviceName.value = "";
   if (meterRafId !== null) {
     cancelAnimationFrame(meterRafId);
     meterRafId = null;
@@ -248,6 +289,36 @@ function stopVoiceChanger() {
   latency.value = 0;
   inputLevel.value = 0;
   outputLevel.value = 0;
+
+  // Reset ring buffer
+  outputRing = new Float32Array(RING_SIZE);
+  ringWritePos = 0;
+  ringReadPos = 0;
+  ringBuffered = 0;
+  prebufferDone = false;
+}
+
+async function pollGpuStats() {
+  try {
+    const resp = await fetch("http://127.0.0.1:8765/api/gpu/stats");
+    const data = await resp.json();
+    gpuStats.value = data.available ? data : null;
+  } catch {
+    gpuStats.value = null;
+  }
+}
+
+function startGpuPolling() {
+  pollGpuStats();
+  gpuPollInterval = setInterval(pollGpuStats, 2000);
+}
+
+function stopGpuPolling() {
+  if (gpuPollInterval) {
+    clearInterval(gpuPollInterval);
+    gpuPollInterval = null;
+  }
+  gpuStats.value = null;
 }
 
 async function loadModels() {
@@ -264,6 +335,7 @@ loadModels();
 
 onUnmounted(() => {
   stopVoiceChanger();
+  stopGpuPolling();
 });
 </script>
 
@@ -343,6 +415,62 @@ onUnmounted(() => {
           <span :class="['value', { warn: latency > 200 }]">{{ latency }}ms</span>
         </div>
       </div>
+    </div>
+
+    <div v-if="isActive && deviceType" class="device-stats card">
+      <h2>Render Device</h2>
+      <div class="device-badge" :class="deviceType">
+        <svg v-if="deviceType === 'cuda'" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>
+        <span>{{ deviceType === 'cuda' ? 'GPU' : 'CPU' }}</span>
+        <span class="device-name">{{ deviceName }}</span>
+      </div>
+
+      <template v-if="gpuStats">
+        <div class="gpu-grid">
+          <div class="gpu-stat">
+            <div class="gpu-stat-header">
+              <span>GPU Usage</span>
+              <span class="gpu-stat-value">{{ gpuStats.utilization }}%</span>
+            </div>
+            <div class="vu-track">
+              <div class="vu-fill gpu-fill" :class="{ hot: gpuStats.utilization > 90 }" :style="{ width: gpuStats.utilization + '%' }"></div>
+            </div>
+          </div>
+
+          <div class="gpu-stat">
+            <div class="gpu-stat-header">
+              <span>Temperature</span>
+              <span class="gpu-stat-value" :class="{ warn: gpuStats.temperature > 80, danger: gpuStats.temperature > 90 }">{{ gpuStats.temperature }}°C</span>
+            </div>
+            <div class="vu-track">
+              <div class="vu-fill temp-fill" :class="{ hot: gpuStats.temperature > 80 }" :style="{ width: Math.min(100, gpuStats.temperature) + '%' }"></div>
+            </div>
+          </div>
+
+          <div class="gpu-stat">
+            <div class="gpu-stat-header">
+              <span>VRAM</span>
+              <span class="gpu-stat-value">{{ gpuStats.memory_used_mb }} / {{ gpuStats.memory_total_mb }} MB</span>
+            </div>
+            <div class="vu-track">
+              <div class="vu-fill vram-fill" :class="{ hot: gpuStats.memory_used_mb / gpuStats.memory_total_mb > 0.9 }" :style="{ width: (gpuStats.memory_used_mb / gpuStats.memory_total_mb * 100) + '%' }"></div>
+            </div>
+          </div>
+
+          <div v-if="gpuStats.power_draw_w != null" class="gpu-stat">
+            <div class="gpu-stat-header">
+              <span>Power</span>
+              <span class="gpu-stat-value">{{ gpuStats.power_draw_w.toFixed(0) }}W{{ gpuStats.power_limit_w ? ' / ' + gpuStats.power_limit_w.toFixed(0) + 'W' : '' }}</span>
+            </div>
+            <div v-if="gpuStats.power_limit_w" class="vu-track">
+              <div class="vu-fill power-fill" :style="{ width: (gpuStats.power_draw_w / gpuStats.power_limit_w * 100) + '%' }"></div>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <p v-else-if="deviceType === 'cpu'" class="cpu-note">Running on CPU — inference will be slower. Enable CUDA in Setup for GPU acceleration.</p>
     </div>
 
     <div v-if="isActive" class="vu-meters">
@@ -529,6 +657,90 @@ input[type="range"] {
 
 .output-fill.hot {
   background: linear-gradient(90deg, var(--accent) 0%, var(--warning) 60%, var(--danger) 100%);
+}
+
+.device-stats {
+  margin-top: 24px;
+  margin-bottom: 0;
+}
+
+.device-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+
+.device-badge.cuda {
+  background: rgba(118, 185, 0, 0.15);
+  color: #76b900;
+  border: 1px solid rgba(118, 185, 0, 0.3);
+}
+
+.device-badge.cpu {
+  background: rgba(52, 152, 219, 0.15);
+  color: #3498db;
+  border: 1px solid rgba(52, 152, 219, 0.3);
+}
+
+.device-name {
+  font-weight: 400;
+  color: var(--text-secondary);
+  margin-left: 4px;
+}
+
+.gpu-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.gpu-stat-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.gpu-stat-value {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.gpu-stat-value.warn {
+  color: var(--warning);
+}
+
+.gpu-stat-value.danger {
+  color: var(--danger);
+}
+
+.gpu-fill {
+  background: linear-gradient(90deg, #76b900 0%, #a4d233 70%, var(--warning) 95%);
+}
+
+.temp-fill {
+  background: linear-gradient(90deg, #3498db 0%, #2ecc71 30%, var(--warning) 70%, var(--danger) 95%);
+}
+
+.vram-fill {
+  background: linear-gradient(90deg, #9b59b6 0%, #8e44ad 70%, var(--warning) 95%);
+}
+
+.power-fill {
+  background: linear-gradient(90deg, #f39c12 0%, #e67e22 70%, var(--danger) 95%);
+}
+
+.cpu-note {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin: 0;
 }
 
 @media (max-width: 800px) {

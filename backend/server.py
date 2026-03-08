@@ -36,6 +36,7 @@ for d in [MODELS_DIR, REFERENCES_DIR, OUTPUT_DIR, TRAINING_DIR]:
 # Global state
 voice_engine = None
 training_jobs: dict = {}
+cuda_enabled: bool = True  # When False, force CPU even if CUDA is available
 
 
 def get_seed_vc_path():
@@ -44,6 +45,314 @@ def get_seed_vc_path():
     if str(SEED_VC_DIR) not in sys.path:
         sys.path.insert(0, str(SEED_VC_DIR))
     return SEED_VC_DIR
+
+
+def _refresh_path():
+    """Reload PATH from the Windows registry so newly-installed tools are found."""
+    if sys.platform == "win32":
+        import winreg
+        parts = []
+        for hive, subkey in [
+            (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+            (winreg.HKEY_CURRENT_USER, r"Environment"),
+        ]:
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    val, _ = winreg.QueryValueEx(key, "Path")
+                    parts.append(val)
+            except OSError:
+                pass
+        if parts:
+            os.environ["PATH"] = ";".join(parts)
+
+
+@app.get("/api/prerequisites")
+async def check_prerequisites():
+    """Check all required system tools and return their status."""
+    _refresh_path()
+    results = []
+
+    # 1. Python
+    py_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    py_ok = sys.version_info >= (3, 8)
+    results.append({
+        "id": "python",
+        "name": "Python 3.8+",
+        "installed": py_ok,
+        "version": py_version,
+        "description": "Required to run the backend server and seed-vc engine",
+        "install_hint": "Download from https://www.python.org/downloads/",
+        "auto_install": False,
+    })
+
+    # 2. Git
+    git_version = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            git_version = stdout.decode().strip().replace("git version ", "")
+    except FileNotFoundError:
+        pass
+    results.append({
+        "id": "git",
+        "name": "Git",
+        "installed": git_version is not None,
+        "version": git_version,
+        "description": "Required to clone the seed-vc repository",
+        "install_hint": "Download from https://git-scm.com/downloads",
+        "auto_install": False,
+    })
+
+    # 3. pip
+    pip_version = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            pip_version = stdout.decode().strip().split()[1]
+    except FileNotFoundError:
+        pass
+    results.append({
+        "id": "pip",
+        "name": "pip",
+        "installed": pip_version is not None,
+        "version": pip_version,
+        "description": "Python package manager for installing dependencies",
+        "install_hint": "Run: python -m ensurepip --upgrade",
+        "auto_install": False,
+    })
+
+    # 4. ffmpeg
+    ffmpeg_version = None
+    ffmpeg_candidates = ["ffmpeg"]
+    if sys.platform == "win32":
+        # Common winget / manual install locations
+        for base in [
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
+            r"C:\ffmpeg\bin",
+            r"C:\Program Files\ffmpeg\bin",
+            r"C:\tools\ffmpeg\bin",
+        ]:
+            candidate = os.path.join(base, "ffmpeg.exe")
+            if os.path.isfile(candidate):
+                ffmpeg_candidates.insert(0, candidate)
+                break
+    for ffmpeg_bin in ffmpeg_candidates:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg_bin, "-version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                first_line = stdout.decode().split("\n")[0]
+                ffmpeg_version = first_line.strip()
+                break
+        except FileNotFoundError:
+            continue
+    results.append({
+        "id": "ffmpeg",
+        "name": "FFmpeg",
+        "installed": ffmpeg_version is not None,
+        "version": ffmpeg_version,
+        "description": "Required for audio format conversion (used by librosa/torchaudio)",
+        "install_hint": "Download from https://ffmpeg.org/download.html or run: winget install ffmpeg",
+        "auto_install": True,
+    })
+
+    # 5. CUDA / GPU
+    cuda_available = False
+    cuda_version = None
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            cuda_version = torch.version.cuda
+    except ImportError:
+        pass
+    results.append({
+        "id": "cuda",
+        "name": "CUDA (GPU)",
+        "installed": cuda_available,
+        "version": cuda_version,
+        "description": "GPU acceleration for real-time voice conversion (optional but strongly recommended)",
+        "install_hint": "Install NVIDIA drivers and CUDA toolkit from https://developer.nvidia.com/cuda-downloads",
+        "auto_install": False,
+        "optional": True,
+    })
+
+    # 6. Backend Python packages
+    backend_req = BASE_DIR / "backend" / "requirements.txt"
+    missing_packages = []
+    if backend_req.exists():
+        import importlib.metadata
+        for line in backend_req.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pkg_name = line.split(">=")[0].split("==")[0].split("[")[0].strip()
+            # Map pip names to importable names
+            import_map = {
+                "pyyaml": "yaml",
+                "python-multipart": "multipart",
+                "uvicorn": "uvicorn",
+                "edge-tts": "edge_tts",
+                "huggingface_hub": "huggingface_hub",
+            }
+            lookup = import_map.get(pkg_name, pkg_name.replace("-", "_"))
+            try:
+                importlib.metadata.version(pkg_name)
+            except importlib.metadata.PackageNotFoundError:
+                # Try alternate name
+                try:
+                    importlib.metadata.version(lookup)
+                except importlib.metadata.PackageNotFoundError:
+                    missing_packages.append(line)
+
+    results.append({
+        "id": "backend_packages",
+        "name": "Backend Python Packages",
+        "installed": len(missing_packages) == 0,
+        "version": f"{len(missing_packages)} missing" if missing_packages else "All installed",
+        "description": "Python dependencies for the backend server (FastAPI, PyTorch, etc.)",
+        "install_hint": f"Run: pip install -r backend/requirements.txt",
+        "auto_install": True,
+        "missing": missing_packages,
+    })
+
+    # 7. huggingface_hub[hf_xet]
+    hf_xet_installed = False
+    try:
+        importlib.metadata.version("hf_xet")
+        hf_xet_installed = True
+    except Exception:
+        pass
+    results.append({
+        "id": "hf_xet",
+        "name": "HuggingFace XET Extension",
+        "installed": hf_xet_installed,
+        "version": None,
+        "description": "Fast model downloads from HuggingFace Hub",
+        "install_hint": 'Run: pip install "huggingface_hub[hf_xet]"',
+        "auto_install": True,
+    })
+
+    # 8. yt-dlp (for YouTube audio import)
+    yt_dlp_version = None
+    yt_dlp_cmd = _find_yt_dlp()
+    if yt_dlp_cmd:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *yt_dlp_cmd, "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                yt_dlp_version = stdout.decode().strip()
+        except FileNotFoundError:
+            pass
+    results.append({
+        "id": "yt_dlp",
+        "name": "yt-dlp",
+        "installed": yt_dlp_version is not None,
+        "version": yt_dlp_version,
+        "description": "YouTube audio downloader for the Audio Cropper (optional)",
+        "install_hint": "Run: pip install yt-dlp",
+        "auto_install": True,
+        "optional": True,
+    })
+
+    # 9. seed-vc
+    seed_vc_installed = SEED_VC_DIR.exists()
+    results.append({
+        "id": "seed_vc",
+        "name": "seed-vc Engine",
+        "installed": seed_vc_installed,
+        "version": None,
+        "description": "AI voice conversion engine that powers Troller",
+        "install_hint": "Install via the Setup tab",
+        "auto_install": True,
+    })
+
+    return {"prerequisites": results}
+
+
+@app.post("/api/prerequisites/install")
+async def install_prerequisite(item_id: str = Form(...)):
+    """Install a prerequisite by ID."""
+    if item_id == "backend_packages":
+        req_file = BASE_DIR / "backend" / "requirements.txt"
+        if not req_file.exists():
+            return JSONResponse(status_code=400, content={"error": "requirements.txt not found"})
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "-r", str(req_file),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            return JSONResponse(status_code=500, content={
+                "error": f"pip install failed: {stderr.decode()[-500:]}"
+            })
+        return {"status": "installed", "id": item_id, "log": stdout.decode()[-500:]}
+
+    elif item_id == "hf_xet":
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "huggingface_hub[hf_xet]",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            return JSONResponse(status_code=500, content={
+                "error": f"pip install failed: {stderr.decode()[-500:]}"
+            })
+        return {"status": "installed", "id": item_id, "log": stdout.decode()[-500:]}
+
+    elif item_id == "ffmpeg":
+        # Try winget on Windows
+        proc = await asyncio.create_subprocess_exec(
+            "winget", "install", "--id", "Gyan.FFmpeg", "-e", "--accept-source-agreements", "--accept-package-agreements",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            return JSONResponse(status_code=500, content={
+                "error": f"winget install failed: {stderr.decode()[-500:]}. Install manually from https://ffmpeg.org/download.html"
+            })
+        return {"status": "installed", "id": item_id, "log": stdout.decode()[-500:]}
+
+    elif item_id == "yt_dlp":
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "yt-dlp",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            return JSONResponse(status_code=500, content={
+                "error": f"pip install failed: {stderr.decode()[-500:]}"
+            })
+        return {"status": "installed", "id": item_id, "log": stdout.decode()[-500:]}
+
+    elif item_id == "seed_vc":
+        # Delegate to existing setup endpoint
+        return await setup_seed_vc()
+
+    else:
+        return JSONResponse(status_code=400, content={"error": f"Cannot auto-install '{item_id}'. Please install manually."})
 
 
 @app.get("/api/status")
@@ -280,6 +589,138 @@ async def convert_voice(
     return JSONResponse(status_code=500, content={"error": "No output file generated"})
 
 
+@app.get("/api/device")
+async def get_device_info():
+    """Return whether CUDA GPU or CPU is being used for inference."""
+    device = "cpu"
+    device_name = "CPU"
+    try:
+        import torch
+        if cuda_enabled and torch.cuda.is_available():
+            device = "cuda"
+            device_name = torch.cuda.get_device_name(0)
+    except ImportError:
+        pass
+    return {"device": device, "device_name": device_name}
+
+
+@app.get("/api/cuda")
+async def get_cuda_settings():
+    """Return CUDA availability and whether it's enabled."""
+    global cuda_enabled
+    cuda_available = False
+    cuda_version = None
+    gpu_name = None
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            cuda_version = torch.version.cuda
+            gpu_name = torch.cuda.get_device_name(0)
+    except ImportError:
+        pass
+    return {
+        "cuda_available": cuda_available,
+        "cuda_enabled": cuda_enabled and cuda_available,
+        "cuda_version": cuda_version,
+        "gpu_name": gpu_name,
+    }
+
+
+@app.post("/api/cuda")
+async def set_cuda_enabled(enabled: bool = Form(...)):
+    """Enable or disable CUDA. Takes effect on next model load."""
+    global cuda_enabled
+    cuda_enabled = enabled
+    return {"cuda_enabled": cuda_enabled}
+
+
+from fastapi.responses import StreamingResponse
+import httpx
+
+CUDA_INSTALLER_URL = "https://developer.download.nvidia.com/compute/cuda/12.6.3/local_installers/cuda_12.6.3_561.17_windows.exe"
+CUDA_INSTALLER_FILENAME = "cuda_installer.exe"
+
+
+@app.post("/api/cuda/install")
+async def install_cuda_toolkit():
+    """Download the CUDA toolkit installer and launch it. Streams progress as SSE."""
+    import tempfile
+
+    installer_path = Path(tempfile.gettempdir()) / CUDA_INSTALLER_FILENAME
+
+    async def stream_progress():
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30.0, read=600.0)) as client:
+                async with client.stream("GET", CUDA_INSTALLER_URL) as response:
+                    total = int(response.headers.get("content-length", 0))
+                    downloaded = 0
+                    yield f"data: {json.dumps({'stage': 'downloading', 'downloaded': 0, 'total': total})}\n\n"
+
+                    with open(installer_path, "wb") as f:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 256):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            yield f"data: {json.dumps({'stage': 'downloading', 'downloaded': downloaded, 'total': total})}\n\n"
+
+            yield f"data: {json.dumps({'stage': 'launching'})}\n\n"
+
+            # Launch the installer (non-blocking)
+            import subprocess
+            subprocess.Popen([str(installer_path)], shell=True)
+
+            yield f"data: {json.dumps({'stage': 'launched', 'path': str(installer_path)})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'stage': 'error', 'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream_progress(), media_type="text/event-stream")
+
+
+# ---- GPU Stats ----
+
+@app.get("/api/gpu/stats")
+async def gpu_stats():
+    """Return GPU usage, temperature, and memory info via nvidia-smi."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "nvidia-smi",
+            "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total,name,power.draw,power.limit",
+            "--format=csv,noheader,nounits",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return {"available": False}
+
+        line = stdout.decode().strip().split("\n")[0]
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 5:
+            return {"available": False}
+
+        return {
+            "available": True,
+            "utilization": int(parts[0]) if parts[0].isdigit() else 0,
+            "temperature": int(parts[1]) if parts[1].isdigit() else 0,
+            "memory_used_mb": int(parts[2]) if parts[2].isdigit() else 0,
+            "memory_total_mb": int(parts[3]) if parts[3].isdigit() else 0,
+            "name": parts[4],
+            "power_draw_w": float(parts[5]) if len(parts) > 5 else None,
+            "power_limit_w": float(parts[6]) if len(parts) > 6 else None,
+        }
+    except FileNotFoundError:
+        return {"available": False}
+    except Exception:
+        return {"available": False}
+
+
+# TTS job storage for progress tracking
+_tts_jobs: dict = {}
+
+
 @app.post("/api/tts")
 async def text_to_speech(
     text: str = Form(...),
@@ -289,7 +730,7 @@ async def text_to_speech(
     speed: float = Form(1.0),
     diffusion_steps: int = Form(25),
 ):
-    """Generate speech from text, then convert to the reference voice using seed-vc."""
+    """Start TTS generation and return a job ID for progress tracking."""
     seed_vc = get_seed_vc_path()
     if not seed_vc:
         return JSONResponse(status_code=400, content={"error": "seed-vc not installed. Call /api/setup first."})
@@ -306,7 +747,49 @@ async def text_to_speech(
     if not ref_path:
         return JSONResponse(status_code=404, content={"error": "Reference not found"})
 
-    # Step 1: Generate base TTS audio using edge-tts
+    # Detect device
+    device = "cpu"
+    device_name = "CPU"
+    try:
+        import torch
+        if cuda_enabled and torch.cuda.is_available():
+            device = "cuda"
+            device_name = torch.cuda.get_device_name(0)
+    except ImportError:
+        pass
+
+    job_id = uuid.uuid4().hex[:8]
+    _tts_jobs[job_id] = {
+        "status": "running",
+        "stage": "tts_generate",
+        "stage_label": "Generating base speech...",
+        "progress": 0,
+        "device": device,
+        "device_name": device_name,
+        "error": None,
+        "output_file": None,
+        "_process": None,
+    }
+
+    asyncio.create_task(_run_tts_job(
+        job_id, text, ref_path, model_id, tts_voice, speed, diffusion_steps, seed_vc,
+    ))
+
+    return {"job_id": job_id, "device": device, "device_name": device_name}
+
+
+async def _run_tts_job(
+    job_id: str, text: str, ref_path: Path, model_id: str,
+    tts_voice: str, speed: float, diffusion_steps: int, seed_vc: Path,
+):
+    """Run TTS pipeline in background, updating progress in _tts_jobs."""
+    job = _tts_jobs[job_id]
+
+    # Stage 1: Generate base TTS audio (0-15%)
+    job["stage"] = "tts_generate"
+    job["stage_label"] = "Generating base speech with edge-tts..."
+    job["progress"] = 5
+
     tts_output = OUTPUT_DIR / f"tts_base_{uuid.uuid4().hex[:8]}.mp3"
     speed_pct = int((speed - 1.0) * 100)
     speed_str = f"+{speed_pct}%" if speed_pct >= 0 else f"{speed_pct}%"
@@ -316,13 +799,27 @@ async def text_to_speech(
         communicate = edge_tts.Communicate(text, tts_voice, rate=speed_str)
         await communicate.save(str(tts_output))
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"TTS generation failed: {str(e)}"})
+        job["status"] = "failed"
+        job["error"] = f"TTS generation failed: {str(e)}"
+        return
+
+    if job["status"] == "cancelled":
+        tts_output.unlink(missing_ok=True)
+        return
 
     if not tts_output.exists() or tts_output.stat().st_size == 0:
         tts_output.unlink(missing_ok=True)
-        return JSONResponse(status_code=500, content={"error": "TTS produced no audio"})
+        job["status"] = "failed"
+        job["error"] = "TTS produced no audio"
+        return
 
-    # Step 2: Run seed-vc voice conversion on the TTS output
+    job["progress"] = 15
+
+    # Stage 2: Voice conversion with seed-vc (15-90%)
+    job["stage"] = "voice_convert"
+    job["stage_label"] = f"Loading model on {job['device_name']}..."
+    job["progress"] = 16
+
     is_v2 = model_id.startswith("v2-")
     script = "inference_v2.py" if is_v2 else "inference.py"
 
@@ -352,29 +849,129 @@ async def text_to_speech(
             if config_files:
                 cmd.extend(["--config", str(config_files[0])])
 
+    job["progress"] = 20
+
+    if job["status"] == "cancelled":
+        tts_output.unlink(missing_ok=True)
+        return
+
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(seed_vc),
     )
-    stdout, stderr = await process.communicate()
+    job["_process"] = process
+
+    # Read stderr in background to estimate progress during inference
+    inference_line_count = 0
+    async def _read_inference_progress():
+        nonlocal inference_line_count
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            text_line = line.decode(errors="replace").strip()
+            inference_line_count += 1
+            # Update progress: 20-90% range spread across inference output
+            if job["progress"] < 88:
+                # First few lines are model loading, then inference starts
+                if inference_line_count <= 3:
+                    job["stage_label"] = f"Loading model on {job['device_name']}..."
+                    job["progress"] = min(20 + inference_line_count * 3, 30)
+                else:
+                    job["stage_label"] = f"Running inference on {job['device_name']}..."
+                    # Gradually advance through the 30-88% range
+                    job["progress"] = min(30 + (inference_line_count - 3) * 3, 88)
+
+    await asyncio.gather(
+        _read_inference_progress(),
+        process.stdout.read(),
+    )
+    await process.wait()
 
     # Clean up TTS temp file
     tts_output.unlink(missing_ok=True)
 
     if process.returncode != 0:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Voice conversion failed: {stderr.decode()[-500:]}"},
-        )
+        job["status"] = "failed"
+        job["error"] = "Voice conversion failed"
+        return
 
-    # Find the output file
+    # Stage 3: Finalizing (90-100%)
+    job["stage"] = "finalizing"
+    job["stage_label"] = "Finalizing output..."
+    job["progress"] = 95
+
     output_files = sorted(OUTPUT_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
     if output_files:
-        return FileResponse(output_files[0], media_type="audio/wav", filename="tts_output.wav")
+        job["output_file"] = output_files[0].name
+        job["status"] = "completed"
+        job["progress"] = 100
+        job["stage_label"] = "Done"
+    else:
+        job["status"] = "failed"
+        job["error"] = "No output file generated"
 
-    return JSONResponse(status_code=500, content={"error": "No output file generated"})
+
+@app.get("/api/tts/status/{job_id}")
+async def tts_job_status(job_id: str):
+    """Get TTS job progress with GPU stats."""
+    if job_id not in _tts_jobs:
+        return JSONResponse(status_code=404, content={"error": "Job not found"})
+    job = _tts_jobs[job_id]
+    result = {
+        "status": job["status"],
+        "stage": job["stage"],
+        "stage_label": job["stage_label"],
+        "progress": job["progress"],
+        "device": job["device"],
+        "device_name": job["device_name"],
+        "error": job["error"],
+        "output_file": job["output_file"],
+    }
+    # Include GPU stats during active generation
+    if job["status"] == "running" and job["device"] == "cuda":
+        try:
+            gpu_data = await gpu_stats()
+            if gpu_data.get("available"):
+                result["gpu"] = gpu_data
+        except Exception:
+            pass
+    return result
+
+
+@app.post("/api/tts/cancel/{job_id}")
+async def tts_cancel(job_id: str):
+    """Cancel a running TTS job."""
+    if job_id not in _tts_jobs:
+        return JSONResponse(status_code=404, content={"error": "Job not found"})
+    job = _tts_jobs[job_id]
+    if job["status"] != "running":
+        return {"status": job["status"]}
+    job["status"] = "cancelled"
+    job["stage_label"] = "Cancelled"
+    proc = job.get("_process")
+    if proc and proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    return {"status": "cancelled"}
+
+
+@app.get("/api/tts/download/{job_id}")
+async def tts_download(job_id: str):
+    """Download completed TTS output."""
+    if job_id not in _tts_jobs:
+        return JSONResponse(status_code=404, content={"error": "Job not found"})
+    job = _tts_jobs[job_id]
+    if job["status"] != "completed" or not job["output_file"]:
+        return JSONResponse(status_code=400, content={"error": "Job not completed"})
+    file_path = OUTPUT_DIR / job["output_file"]
+    if not file_path.exists():
+        return JSONResponse(status_code=404, content={"error": "Output file not found"})
+    return FileResponse(file_path, media_type="audio/wav", filename="tts_output.wav")
 
 
 @app.post("/api/train/start")
@@ -639,7 +1236,7 @@ def _get_rt_models(model_id="seed-uvit-tat-xlsr-tiny"):
         from hf_utils import load_custom_model_from_hf
         from modules.audio import mel_spectrogram
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda" if (cuda_enabled and torch.cuda.is_available()) else "cpu")
 
         # Determine checkpoint and config
         custom_model_dir = MODELS_DIR / model_id
@@ -1054,7 +1651,19 @@ async def realtime_voice_conversion(websocket: WebSocket):
         session = RealtimeVCSession(ref_path, model_id)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, session.initialize)
-        await websocket.send_json({"status": "ready"})
+
+        # Include device info in the ready message
+        device_type = "cpu"
+        device_name = "CPU"
+        if session.models and session.models.get("device"):
+            d = session.models["device"]
+            device_type = d.type
+            if d.type == "cuda":
+                import torch
+                device_name = torch.cuda.get_device_name(d.index or 0)
+            else:
+                device_name = "CPU"
+        await websocket.send_json({"status": "ready", "device": device_type, "device_name": device_name})
 
         # Stream audio chunks
         while True:
@@ -1073,6 +1682,147 @@ async def realtime_voice_conversion(websocket: WebSocket):
             await websocket.send_json({"error": str(e)})
         except Exception:
             pass
+
+
+# ---- YouTube Audio Fetch ----
+
+import subprocess
+import tempfile
+import re as _re
+
+_yt_temp_files: dict = {}  # fileId -> { path, filename, title, created }
+
+
+def _find_yt_dlp():
+    """Find yt-dlp executable or fallback to python -m yt_dlp."""
+    if shutil.which("yt-dlp"):
+        return ["yt-dlp"]
+    # Fallback: run as a Python module (works when installed via pip but not on PATH)
+    try:
+        import importlib.util
+        if importlib.util.find_spec("yt_dlp"):
+            return [sys.executable, "-m", "yt_dlp"]
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/api/youtube/fetch")
+async def youtube_fetch_stream(url: str = ""):
+    """Fetch audio from YouTube URL with SSE progress streaming."""
+    from starlette.responses import StreamingResponse
+
+    url = url.strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "YouTube URL is required"})
+
+    yt_dlp = _find_yt_dlp()
+    if not yt_dlp:
+        return JSONResponse(status_code=400, content={"error": "yt-dlp not found. Install with: pip install yt-dlp"})
+
+    async def event_stream():
+        def send_event(event: str, data: dict):
+            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+        try:
+            # Phase 1: Metadata
+            yield send_event("phase", {"phase": "metadata"})
+
+            meta_proc = await asyncio.create_subprocess_exec(
+                *yt_dlp, "--no-download", "-j", "--no-warnings", url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            meta_stdout, _ = await meta_proc.communicate()
+
+            video_title = "youtube_audio"
+            video_duration = 0
+            try:
+                meta = json.loads(meta_stdout.decode())
+                video_title = meta.get("title", meta.get("fulltitle", "youtube_audio"))
+                video_duration = meta.get("duration", 0)
+            except Exception:
+                pass
+
+            yield send_event("metadata", {"title": video_title, "durationSeconds": video_duration})
+
+            # Phase 2: Download
+            yield send_event("phase", {"phase": "downloading"})
+
+            tmp_dir = tempfile.gettempdir()
+            safe_title = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', video_title).strip() or "youtube_audio"
+            out_template = os.path.join(tmp_dir, f"{safe_title}.%(ext)s")
+
+            dl_proc = await asyncio.create_subprocess_exec(
+                *yt_dlp,
+                "-f", "bestaudio[ext=m4a]/bestaudio",
+                "-o", out_template,
+                "--no-playlist", "--no-warnings", "--force-overwrites", "--newline",
+                url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+
+            progress_re = _re.compile(r'\[download]\s+([\d.]+)%')
+
+            async for line in dl_proc.stdout:
+                text = line.decode(errors="replace")
+                match = progress_re.search(text)
+                if match:
+                    yield send_event("progress", {"percent": float(match.group(1))})
+
+            await dl_proc.wait()
+
+            if dl_proc.returncode != 0:
+                stderr_out = await dl_proc.stderr.read()
+                yield send_event("error", {"message": stderr_out.decode(errors="replace") or "yt-dlp failed"})
+                return
+
+            # Phase 3: Find output file
+            yield send_event("phase", {"phase": "processing"})
+
+            out_path = None
+            for ext in ["m4a", "webm", "opus", "ogg", "mp3"]:
+                candidate = os.path.join(tmp_dir, f"{safe_title}.{ext}")
+                if os.path.exists(candidate):
+                    out_path = candidate
+                    break
+
+            if not out_path:
+                yield send_event("error", {"message": "yt-dlp did not produce an output file"})
+                return
+
+            file_id = uuid.uuid4().hex[:12]
+            _yt_temp_files[file_id] = {
+                "path": out_path,
+                "filename": os.path.basename(out_path),
+                "title": video_title,
+                "created": asyncio.get_event_loop().time(),
+            }
+
+            yield send_event("done", {
+                "fileId": file_id,
+                "fileName": os.path.basename(out_path),
+                "title": video_title,
+                "durationSeconds": video_duration,
+            })
+
+        except Exception as e:
+            yield send_event("error", {"message": str(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/youtube/download/{file_id}")
+async def youtube_download(file_id: str):
+    """Download a previously fetched YouTube audio file."""
+    entry = _yt_temp_files.get(file_id)
+    if not entry or not os.path.exists(entry["path"]):
+        return JSONResponse(status_code=404, content={"error": "File not found or expired"})
+
+    return FileResponse(entry["path"], filename=entry["filename"])
 
 
 @app.get("/api/output/{filename}")
