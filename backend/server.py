@@ -85,30 +85,7 @@ async def check_prerequisites():
         "auto_install": False,
     })
 
-    # 2. Git
-    git_version = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode == 0:
-            git_version = stdout.decode().strip().replace("git version ", "")
-    except FileNotFoundError:
-        pass
-    results.append({
-        "id": "git",
-        "name": "Git",
-        "installed": git_version is not None,
-        "version": git_version,
-        "description": "Required to clone the seed-vc repository",
-        "install_hint": "Download from https://git-scm.com/downloads",
-        "auto_install": False,
-    })
-
-    # 3. pip
+    # 2. pip
     pip_version = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -191,7 +168,24 @@ async def check_prerequisites():
         "optional": True,
     })
 
-    # 6. Backend Python packages
+    # 6. scikit-learn
+    sklearn_version = None
+    try:
+        import importlib.metadata
+        sklearn_version = importlib.metadata.version("scikit-learn")
+    except Exception:
+        pass
+    results.append({
+        "id": "scikit_learn",
+        "name": "scikit-learn",
+        "installed": sklearn_version is not None,
+        "version": sklearn_version,
+        "description": "Machine learning library used for audio feature clustering and analysis",
+        "install_hint": "Run: pip install scikit-learn",
+        "auto_install": True,
+    })
+
+    # 7. Backend Python packages
     backend_req = BASE_DIR / "backend" / "requirements.txt"
     missing_packages = []
     if backend_req.exists():
@@ -285,6 +279,23 @@ async def check_prerequisites():
         "auto_install": True,
     })
 
+    # 10. nemo_toolkit (optional, for speaker diarization)
+    nemo_version = None
+    try:
+        nemo_version = importlib.metadata.version("nemo_toolkit")
+    except Exception:
+        pass
+    results.append({
+        "id": "nemo_toolkit",
+        "name": "NVIDIA NeMo Toolkit",
+        "installed": nemo_version is not None,
+        "version": nemo_version,
+        "description": "Speaker diarization support (optional, large download ~2GB+)",
+        "install_hint": 'Run: pip install cmake Cython && pip install "nemo_toolkit[asr]>=2.0.0"',
+        "auto_install": True,
+        "optional": True,
+    })
+
     return {"prerequisites": results}
 
 
@@ -295,17 +306,26 @@ async def install_prerequisite(item_id: str = Form(...)):
         req_file = BASE_DIR / "backend" / "requirements.txt"
         if not req_file.exists():
             return JSONResponse(status_code=400, content={"error": "requirements.txt not found"})
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "pip", "install", "-r", str(req_file),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            return JSONResponse(status_code=500, content={
-                "error": f"pip install failed: {stderr.decode()[-500:]}"
-            })
-        return {"status": "installed", "id": item_id, "log": stdout.decode()[-500:]}
+        from starlette.responses import StreamingResponse
+
+        async def stream_backend_install():
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "pip", "install", "-r", str(req_file),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            async for line in proc.stdout:
+                text = line.decode(errors="replace").rstrip()
+                if text:
+                    yield f"data: {json.dumps({'stage': 'progress', 'line': text})}\n\n"
+            await proc.wait()
+            if proc.returncode == 0:
+                yield f"data: {json.dumps({'stage': 'done'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'stage': 'error', 'error': f'pip exited with code {proc.returncode}'})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(stream_backend_install(), media_type="text/event-stream")
 
     elif item_id == "hf_xet":
         proc = await asyncio.create_subprocess_exec(
@@ -347,6 +367,74 @@ async def install_prerequisite(item_id: str = Form(...)):
             })
         return {"status": "installed", "id": item_id, "log": stdout.decode()[-500:]}
 
+    elif item_id == "scikit_learn":
+        from starlette.responses import StreamingResponse
+
+        async def stream_pip_install():
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "pip", "install", "scikit-learn",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            async for line in proc.stdout:
+                text = line.decode(errors="replace").rstrip()
+                if text:
+                    yield f"data: {json.dumps({'stage': 'progress', 'line': text})}\n\n"
+            await proc.wait()
+            if proc.returncode == 0:
+                yield f"data: {json.dumps({'stage': 'done'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'stage': 'error', 'error': f'pip exited with code {proc.returncode}'})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(stream_pip_install(), media_type="text/event-stream")
+
+    elif item_id == "nemo_toolkit":
+        from starlette.responses import StreamingResponse
+
+        async def stream_nemo_install():
+            # Install build tools first (cmake, Cython required by nemo)
+            env = os.environ.copy()
+            scripts_dir = os.path.join(os.path.dirname(sys.executable), "Scripts")
+            env["PATH"] = scripts_dir + os.pathsep + env.get("PATH", "")
+
+            yield f"data: {json.dumps({'stage': 'progress', 'line': 'Installing build tools (cmake, Cython)...'})}\n\n"
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "pip", "install", "cmake", "Cython",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            async for line in proc.stdout:
+                text = line.decode(errors="replace").rstrip()
+                if text:
+                    yield f"data: {json.dumps({'stage': 'progress', 'line': text})}\n\n"
+            await proc.wait()
+            if proc.returncode != 0:
+                yield f"data: {json.dumps({'stage': 'error', 'error': 'Failed to install build tools'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            yield f"data: {json.dumps({'stage': 'progress', 'line': 'Installing nemo_toolkit[asr] (this may take several minutes)...'})}\n\n"
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "pip", "install", "nemo_toolkit[asr]>=2.0.0",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            async for line in proc.stdout:
+                text = line.decode(errors="replace").rstrip()
+                if text:
+                    yield f"data: {json.dumps({'stage': 'progress', 'line': text})}\n\n"
+            await proc.wait()
+            if proc.returncode == 0:
+                yield f"data: {json.dumps({'stage': 'done'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'stage': 'error', 'error': f'pip exited with code {proc.returncode}'})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(stream_nemo_install(), media_type="text/event-stream")
+
     elif item_id == "seed_vc":
         # Delegate to existing setup endpoint
         return await setup_seed_vc()
@@ -375,14 +463,70 @@ async def setup_seed_vc():
         return {"status": "already_installed", "path": str(SEED_VC_DIR)}
 
     async def stream_setup():
-        # Step 1: Clone
-        yield f"data: Cloning seed-vc repository...\n\n"
-        process = await asyncio.create_subprocess_exec(
-            "git", "clone", "--progress", "https://github.com/Plachtaa/seed-vc.git", str(SEED_VC_DIR),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        # git clone writes progress to stderr
+        import zipfile
+        import io
+        import httpx
+        import shutil
+
+        # Step 1: Download zip archive from GitHub
+        zip_url = "https://github.com/Plachtaa/seed-vc/archive/refs/heads/main.zip"
+        yield f"data: Downloading seed-vc from GitHub...\n\n"
+
+        try:
+            zip_path = BASE_DIR / "seed-vc-download.zip"
+            async with httpx.AsyncClient(follow_redirects=True, timeout=300) as client:
+                async with client.stream("GET", zip_url) as resp:
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("content-length", 0))
+                    downloaded = 0
+                    with open(zip_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                pct = int(downloaded / total * 100)
+                                mb = downloaded / (1024 * 1024)
+                                total_mb = total / (1024 * 1024)
+                                yield f"data: Downloading... {mb:.1f} / {total_mb:.1f} MB ({pct}%)\n\n"
+                            else:
+                                mb = downloaded / (1024 * 1024)
+                                yield f"data: Downloading... {mb:.1f} MB\n\n"
+
+            yield f"data: Download complete. Extracting...\n\n"
+
+            # Extract zip - GitHub archives extract to seed-vc-main/
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(BASE_DIR)
+
+            # Rename extracted folder to seed-vc
+            extracted_dir = BASE_DIR / "seed-vc-main"
+            if extracted_dir.exists():
+                shutil.move(str(extracted_dir), str(SEED_VC_DIR))
+            else:
+                # Find whatever directory was extracted
+                for item in BASE_DIR.iterdir():
+                    if item.is_dir() and item.name.startswith("seed-vc-"):
+                        shutil.move(str(item), str(SEED_VC_DIR))
+                        break
+
+            # Clean up zip file
+            zip_path.unlink(missing_ok=True)
+
+            if not SEED_VC_DIR.exists():
+                yield f"data: ERROR: Failed to extract seed-vc archive\n\n"
+                return
+
+            yield f"data: Extraction complete. Installing dependencies...\n\n"
+
+        except Exception as e:
+            # Clean up on failure
+            zip_path = BASE_DIR / "seed-vc-download.zip"
+            if zip_path.exists():
+                zip_path.unlink(missing_ok=True)
+            yield f"data: ERROR: Download failed: {e}\n\n"
+            return
+
+        # Step 2: Install pip deps
         async def read_lines(stream):
             buf = b""
             while True:
@@ -404,17 +548,6 @@ async def setup_seed_vc():
                     if line:
                         yield line
 
-        async for line in read_lines(process.stderr):
-            yield f"data: {line}\n\n"
-
-        await process.wait()
-        if process.returncode != 0:
-            yield f"data: ERROR: Failed to clone seed-vc (exit code {process.returncode})\n\n"
-            return
-
-        yield f"data: Clone complete. Installing dependencies...\n\n"
-
-        # Step 2: Install pip deps
         req_file = SEED_VC_DIR / "requirements.txt"
         if req_file.exists():
             pip_proc = await asyncio.create_subprocess_exec(
@@ -1240,6 +1373,137 @@ async def upload_training_data(
     return {"status": "uploaded", "count": len(uploaded), "directory": str(dataset_dir)}
 
 
+# ---- Speaker Diarization (NVIDIA Sortformer) ----
+
+# Lazy-loaded Sortformer model (cached after first use)
+_sortformer_model = None
+
+def _get_sortformer_model():
+    global _sortformer_model
+    if _sortformer_model is None:
+        try:
+            from nemo.collections.asr.models import SortformerEncLabelModel
+        except ImportError:
+            raise RuntimeError(
+                "nemo_toolkit is not installed. Install it from the Prerequisites tab (NVIDIA NeMo Toolkit)."
+            )
+        _sortformer_model = SortformerEncLabelModel.from_pretrained(
+            "nvidia/diar_sortformer_4spk-v1"
+        )
+        _sortformer_model.eval()
+        import torch
+        if torch.cuda.is_available():
+            _sortformer_model = _sortformer_model.cuda()
+    return _sortformer_model
+
+@app.post("/api/diarize")
+async def diarize_audio(file: UploadFile = File(...)):
+    """Perform speaker diarization using NVIDIA Sortformer 4-speaker model.
+
+    Uses the pretrained diar_sortformer_4spk-v1 model which handles up to
+    4 speakers with end-to-end neural diarization (no manual clustering).
+    """
+    import tempfile
+    import librosa
+    import soundfile as sf
+
+    tmp_path = None
+    wav16k_path = None
+    try:
+        # Save upload to temp file
+        suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            tmp.write(await file.read())
+
+        # Load and resample to 16kHz mono WAV (Sortformer requirement)
+        y, sr = librosa.load(tmp_path, sr=16000, mono=True)
+        duration = len(y) / sr
+
+        if duration < 1.0:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Audio too short for diarization (min 1s)"},
+            )
+
+        # Write 16kHz WAV for Sortformer
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav_tmp:
+            wav16k_path = wav_tmp.name
+        sf.write(wav16k_path, y, 16000)
+
+        # Run Sortformer diarization
+        model = _get_sortformer_model()
+
+        # Run diarization and capture return value
+        diarize_result = model.diarize(audio=wav16k_path, batch_size=1)
+        print(f"[diarize] returned type={type(diarize_result).__name__}, value={diarize_result!r}")
+
+        # Parse results: diarize() returns [["start end speaker", ...]]
+        # Each segment string is "start_sec end_sec speaker_label"
+        segments = []
+        raw_segments = diarize_result[0] if isinstance(diarize_result, (list, tuple)) and diarize_result else []
+        for seg in raw_segments:
+            parts = str(seg).strip().split()
+            if len(parts) >= 3:
+                segments.append((float(parts[0]), float(parts[1]), parts[2]))
+
+        print(f"[diarize] parsed {len(segments)} segments")
+
+        if not segments:
+            return {
+                "speakers": [
+                    {
+                        "label": "Person 1",
+                        "segments": [{"start": 0.0, "end": round(duration, 2)}],
+                    }
+                ]
+            }
+
+        # Build per-speaker segment lists
+        speaker_segments: dict[str, list[dict]] = {}
+        for start, end, spk_label in segments:
+            if spk_label not in speaker_segments:
+                speaker_segments[spk_label] = []
+            speaker_segments[spk_label].append({
+                "start": round(float(start), 2),
+                "end": round(float(end), 2),
+            })
+
+        # Merge consecutive or overlapping segments for each speaker
+        for spk in speaker_segments:
+            merged = []
+            for seg in sorted(speaker_segments[spk], key=lambda s: s["start"]):
+                if merged and seg["start"] <= merged[-1]["end"] + 0.1:
+                    merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
+                else:
+                    merged.append(dict(seg))
+            speaker_segments[spk] = merged
+
+        # Re-index speakers starting from 0
+        sorted_speakers = sorted(speaker_segments.keys())
+        result = {
+            "speakers": [
+                {
+                    "label": f"Person {idx + 1}",
+                    "segments": speaker_segments[spk],
+                }
+                for idx, spk in enumerate(sorted_speakers)
+            ]
+        }
+        return result
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Diarization failed: {str(e)}"},
+        )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        if wav16k_path and os.path.exists(wav16k_path):
+            os.unlink(wav16k_path)
+
+
 # ---- Real-time Voice Conversion via WebSocket ----
 
 # Global cache for loaded RT models (heavy: ~1-2 GB on GPU, load once)
@@ -1726,7 +1990,7 @@ import subprocess
 import tempfile
 import re as _re
 
-_yt_temp_files: dict = {}  # fileId -> { path, filename, title, created }
+_yt_temp_files: dict = {}  # fileId -> { path, filename, title, created, url, thumbnail }
 
 
 def _find_yt_dlp():
@@ -1772,14 +2036,16 @@ async def youtube_fetch_stream(url: str = ""):
 
             video_title = "youtube_audio"
             video_duration = 0
+            video_thumbnail = ""
             try:
                 meta = json.loads(meta_stdout.decode())
                 video_title = meta.get("title", meta.get("fulltitle", "youtube_audio"))
                 video_duration = meta.get("duration", 0)
+                video_thumbnail = meta.get("thumbnail", "")
             except Exception:
                 pass
 
-            yield send_event("metadata", {"title": video_title, "durationSeconds": video_duration})
+            yield send_event("metadata", {"title": video_title, "durationSeconds": video_duration, "thumbnail": video_thumbnail})
 
             # Phase 2: Download
             yield send_event("phase", {"phase": "downloading"})
@@ -1832,6 +2098,8 @@ async def youtube_fetch_stream(url: str = ""):
                 "filename": os.path.basename(out_path),
                 "title": video_title,
                 "created": asyncio.get_event_loop().time(),
+                "url": url,
+                "thumbnail": video_thumbnail,
             }
 
             yield send_event("done", {
@@ -1839,6 +2107,7 @@ async def youtube_fetch_stream(url: str = ""):
                 "fileName": os.path.basename(out_path),
                 "title": video_title,
                 "durationSeconds": video_duration,
+                "thumbnail": video_thumbnail,
             })
 
         except Exception as e:
@@ -1859,6 +2128,39 @@ async def youtube_download(file_id: str):
         return JSONResponse(status_code=404, content={"error": "File not found or expired"})
 
     return FileResponse(entry["path"], filename=entry["filename"])
+
+
+@app.get("/api/youtube/cache")
+async def youtube_cache_list():
+    """Return list of cached YouTube downloads that still have files on disk."""
+    items = []
+    for file_id, entry in list(_yt_temp_files.items()):
+        if os.path.exists(entry["path"]):
+            items.append({
+                "fileId": file_id,
+                "url": entry.get("url", ""),
+                "title": entry.get("title", ""),
+                "thumbnail": entry.get("thumbnail", ""),
+                "fileName": entry.get("filename", ""),
+            })
+    return items
+
+
+@app.get("/api/youtube/cache/lookup")
+async def youtube_cache_lookup(url: str = ""):
+    """Check if a YouTube URL is already cached. Returns the cache entry or 404."""
+    url = url.strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "URL is required"})
+    for file_id, entry in _yt_temp_files.items():
+        if entry.get("url") == url and os.path.exists(entry["path"]):
+            return {
+                "fileId": file_id,
+                "fileName": entry.get("filename", ""),
+                "title": entry.get("title", ""),
+                "thumbnail": entry.get("thumbnail", ""),
+            }
+    return JSONResponse(status_code=404, content={"error": "Not in cache"})
 
 
 @app.get("/api/output/{filename}")

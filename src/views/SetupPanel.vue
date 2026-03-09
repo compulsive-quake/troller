@@ -278,7 +278,7 @@ onMounted(() => {
       <h2>seed-vc Installation</h2>
       <p class="card-desc">
         seed-vc is the AI voice conversion engine that powers Troller.
-        It will be cloned from GitHub and its dependencies installed automatically.
+        It will be downloaded from GitHub and its dependencies installed automatically.
       </p>
 
       <button

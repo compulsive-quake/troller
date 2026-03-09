@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, watch, nextTick } from "vue";
 
 defineProps<{ backendReady: boolean }>();
 
@@ -20,7 +20,17 @@ const loading = ref(false);
 const installing = ref<Record<string, boolean>>({});
 const installLogs = ref<Record<string, string>>({});
 const installSuccess = ref<Record<string, boolean>>({});
+const installError = ref<Record<string, boolean>>({});
 const installingAll = ref(false);
+const logEls = ref<Record<string, HTMLElement>>({});
+
+watch(installLogs, () => {
+  nextTick(() => {
+    for (const [id, el] of Object.entries(logEls.value)) {
+      if (el && installing.value[id]) el.scrollTop = el.scrollHeight;
+    }
+  });
+}, { deep: true });
 
 const allRequired = computed(() =>
   prerequisites.value.filter((p) => !p.optional)
@@ -53,8 +63,9 @@ async function checkAll() {
 
 async function install(item: Prerequisite) {
   installing.value[item.id] = true;
-  installLogs.value[item.id] = "Installing...";
+  installLogs.value[item.id] = "";
   installSuccess.value[item.id] = false;
+  installError.value[item.id] = false;
   try {
     const form = new FormData();
     form.append("item_id", item.id);
@@ -62,18 +73,56 @@ async function install(item: Prerequisite) {
       method: "POST",
       body: form,
     });
-    const data = await resp.json();
-    if (resp.ok) {
-      installLogs.value[item.id] = data.log || "Installed successfully";
-      installSuccess.value[item.id] = true;
-      await checkAll();
+    const contentType = resp.headers.get("content-type") || "";
+
+    if (contentType.includes("text/event-stream")) {
+      // Streaming SSE response — show live progress
+      const reader = resp.body?.getReader();
+      if (!reader) throw new Error("No response stream");
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.stage === "progress") {
+              installLogs.value[item.id] += data.line + "\n";
+            } else if (data.stage === "done") {
+              installSuccess.value[item.id] = true;
+              installLogs.value[item.id] += "\nInstalled successfully!";
+              // Auto-update the item status
+              item.installed = true;
+              await checkAll();
+            } else if (data.stage === "error") {
+              installError.value[item.id] = true;
+              installLogs.value[item.id] += `\nError: ${data.error}`;
+            }
+          } catch { /* skip malformed JSON */ }
+        }
+      }
     } else {
-      installLogs.value[item.id] = `Error: ${data.error}`;
-      installSuccess.value[item.id] = false;
+      // JSON response
+      const data = await resp.json();
+      if (resp.ok) {
+        installLogs.value[item.id] = data.log || "Installed successfully";
+        installSuccess.value[item.id] = true;
+        await checkAll();
+      } else {
+        installLogs.value[item.id] = `Error: ${data.error}`;
+        installError.value[item.id] = true;
+      }
     }
   } catch (e: any) {
     installLogs.value[item.id] = `Error: ${e.message}`;
-    installSuccess.value[item.id] = false;
+    installError.value[item.id] = true;
   } finally {
     installing.value[item.id] = false;
   }
@@ -179,7 +228,11 @@ onMounted(checkAll);
           <span class="hint">{{ item.install_hint }}</span>
         </div>
 
-        <div v-if="installLogs[item.id] && !installing[item.id]" :class="['install-log', { 'install-log-success': installSuccess[item.id], 'install-log-error': !installSuccess[item.id] }]">
+        <div v-if="installLogs[item.id] && installing[item.id]" :ref="(el) => { if (el) logEls[item.id] = el as HTMLElement }" class="install-log install-log-streaming">
+          {{ installLogs[item.id] }}
+        </div>
+
+        <div v-if="installLogs[item.id] && !installing[item.id]" :class="['install-log', { 'install-log-success': installSuccess[item.id], 'install-log-error': installError[item.id] }]">
           {{ installLogs[item.id] }}
         </div>
       </div>
@@ -437,6 +490,12 @@ onMounted(checkAll);
 .install-log-error {
   border-left-color: var(--danger);
   color: var(--danger);
+}
+
+.install-log-streaming {
+  border-left-color: var(--warning);
+  color: var(--text-secondary);
+  max-height: 200px;
 }
 
 .prereq-card.optional {

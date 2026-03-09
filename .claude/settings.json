@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch",
+      "WebFetch(domain:docs.aihub.gg)",
+      "WebFetch(domain:kennethmlamar.com)",
+      "Bash(npx vue-tsc --noEmit --pretty)"
+    ]
+  }
+}

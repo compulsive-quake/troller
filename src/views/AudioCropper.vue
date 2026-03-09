@@ -12,6 +12,80 @@ const ytProgress = ref(0)
 const ytTitle = ref('')
 const ytError = ref('')
 
+// ── YouTube cache ────────────────────────────────────────────────────────────
+interface YtCacheEntry {
+  fileId: string
+  url: string
+  title: string
+  thumbnail: string
+  fileName: string
+}
+const ytCache = ref<YtCacheEntry[]>([])
+
+function loadYtCache() {
+  try {
+    const raw = localStorage.getItem('yt-cache')
+    if (raw) ytCache.value = JSON.parse(raw)
+  } catch { ytCache.value = [] }
+}
+
+function saveYtCache() {
+  localStorage.setItem('yt-cache', JSON.stringify(ytCache.value))
+}
+
+function addToYtCache(entry: YtCacheEntry) {
+  // Replace existing entry for same URL
+  ytCache.value = ytCache.value.filter(e => e.url !== entry.url)
+  ytCache.value.unshift(entry)
+  saveYtCache()
+}
+
+async function syncYtCache() {
+  try {
+    const resp = await fetch('http://127.0.0.1:8765/api/youtube/cache')
+    if (resp.ok) {
+      const serverEntries: YtCacheEntry[] = await resp.json()
+      const serverIds = new Set(serverEntries.map(e => e.fileId))
+      // Keep only local entries that still exist on server
+      ytCache.value = ytCache.value.filter(e => serverIds.has(e.fileId))
+      // Add any server entries not in local cache
+      for (const se of serverEntries) {
+        if (!ytCache.value.some(e => e.fileId === se.fileId)) {
+          ytCache.value.push(se)
+        }
+      }
+      saveYtCache()
+    }
+  } catch { /* backend not ready yet */ }
+}
+
+async function useCachedVideo(entry: YtCacheEntry) {
+  ytFetching.value = true
+  ytError.value = ''
+  ytTitle.value = entry.title
+  youtubeUrl.value = entry.url
+  try {
+    const dlResp = await fetch(`http://127.0.0.1:8765/api/youtube/download/${entry.fileId}`)
+    if (!dlResp.ok) {
+      // File expired on server – remove from cache
+      ytCache.value = ytCache.value.filter(e => e.fileId !== entry.fileId)
+      saveYtCache()
+      ytError.value = 'Cached file expired. Please fetch again.'
+      return
+    }
+    const blob = await dlResp.blob()
+    const file = new File([blob], entry.fileName, { type: blob.type })
+    audioFile.value = file
+    audioFileName.value = entry.title || entry.fileName
+    exportName.value = entry.title || 'youtube_audio'
+    loadAudio(file)
+  } catch {
+    ytError.value = 'Failed to load cached file'
+  } finally {
+    ytFetching.value = false
+  }
+}
+
 // ── Audio state ──────────────────────────────────────────────────────────────
 const audioFile = ref<File | null>(null)
 const audioFileName = ref('')
@@ -21,6 +95,7 @@ const previewDuration = ref(0)
 const previewCurrentTime = ref(0)
 const previewIsPlaying = ref(false)
 const previewPlayheadPos = ref(0)
+const seekOriginPos = ref<number | null>(null) // 0-1 fraction where user clicked to seek
 const volumeGain = ref(1.0)
 
 // ── Multi-crop state ─────────────────────────────────────────────────────────
@@ -31,7 +106,16 @@ interface CutRegion {
 }
 const cutRegions = ref<CutRegion[]>([])
 const selectedRegionId = ref<string | null>(null)
-const dragState = ref<{ regionId: string; handle: 'start' | 'end' } | null>(null)
+
+// Pending cut region (being positioned, not yet applied)
+const pendingRegion = ref<CutRegion | null>(null)
+
+
+// ── Zoom & pan state ────────────────────────────────────────────────────────
+const zoomLevel = ref(1)        // 1 = full view, higher = zoomed in
+const viewStart = ref(0)        // left edge as 0-1 fraction of full audio
+const MAX_ZOOM = 100
+const MIN_ZOOM = 1
 
 // ── Export / action state ────────────────────────────────────────────────────
 const exporting = ref(false)
@@ -39,10 +123,34 @@ const exportName = ref('')
 const actionMessage = ref('')
 const actionError = ref('')
 
+// ── Speaker diarization state ───────────────────────────────────────────────
+interface SpeakerSegment {
+  start: number // seconds
+  end: number   // seconds
+}
+interface Speaker {
+  label: string
+  segments: SpeakerSegment[]
+}
+const speakerData = ref<Speaker[]>([])
+const diarizing = ref(false)
+const diarizeError = ref('')
+const autoDetectSpeakers = ref(localStorage.getItem('autoDetectSpeakers') !== 'false')
+const SPEAKER_COLORS = [
+  '#3498db', // blue
+  '#e74c3c', // red
+  '#2ecc71', // green
+  '#f39c12', // orange
+  '#9b59b6', // purple
+  '#1abc9c', // teal
+]
+
 // ── Canvas refs ──────────────────────────────────────────────────────────────
 const waveformCanvasRef = ref<HTMLCanvasElement | null>(null)
 const frequencyCanvasRef = ref<HTMLCanvasElement | null>(null)
 const waveformSectionRef = ref<HTMLDivElement | null>(null)
+const minimapCanvasRef = ref<HTMLCanvasElement | null>(null)
+const speakerBarCanvasRef = ref<HTMLCanvasElement | null>(null)
 
 // ── Internal audio state ─────────────────────────────────────────────────────
 let audioCtx: AudioContext | null = null
@@ -62,50 +170,21 @@ let lastPeakDecayTime = 0
 let dragMoveBound: ((e: MouseEvent) => void) | null = null
 let dragEndBound: (() => void) | null = null
 
+// Pan-drag state
+let panDragActive = false
+let panStartX = 0
+let panStartViewStart = 0
+let panTotalDelta = 0
+
+// Middle-mouse pan state
+const middleMousePanning = ref(false)
+let middlePanMoveBound: ((e: MouseEvent) => void) | null = null
+let middlePanEndBound: ((e: MouseEvent) => void) | null = null
+
 // ── Computed ─────────────────────────────────────────────────────────────────
-const sortedCutRegions = computed(() =>
-  [...cutRegions.value].sort((a, b) => a.start - b.start)
-)
+const viewSpan = computed(() => 1 / zoomLevel.value)
+const isZoomed = computed(() => zoomLevel.value > 1.01)
 
-const keptDuration = computed(() => {
-  if (!previewDuration.value) return 0
-  let cutTotal = 0
-  for (const r of mergedCutRegions.value) {
-    cutTotal += (r.end - r.start) * previewDuration.value
-  }
-  return previewDuration.value - cutTotal
-})
-
-// Merge overlapping cut regions for export
-const mergedCutRegions = computed(() => {
-  const sorted = [...cutRegions.value].sort((a, b) => a.start - b.start)
-  const merged: { start: number; end: number }[] = []
-  for (const r of sorted) {
-    if (merged.length > 0 && r.start <= merged[merged.length - 1].end) {
-      merged[merged.length - 1].end = Math.max(merged[merged.length - 1].end, r.end)
-    } else {
-      merged.push({ start: r.start, end: r.end })
-    }
-  }
-  return merged
-})
-
-// Kept regions (inverse of cut regions)
-const keptRegions = computed(() => {
-  const cuts = mergedCutRegions.value
-  const kept: { start: number; end: number }[] = []
-  let pos = 0
-  for (const cut of cuts) {
-    if (cut.start > pos) {
-      kept.push({ start: pos, end: cut.start })
-    }
-    pos = cut.end
-  }
-  if (pos < 1) {
-    kept.push({ start: pos, end: 1 })
-  }
-  return kept
-})
 
 // ── File import ──────────────────────────────────────────────────────────────
 function onFileSelected(event: Event) {
@@ -121,6 +200,14 @@ function onFileSelected(event: Event) {
 // ── YouTube import ───────────────────────────────────────────────────────────
 async function fetchYoutube() {
   if (!youtubeUrl.value.trim()) return
+
+  // Check cache first
+  const cachedEntry = ytCache.value.find(e => e.url === youtubeUrl.value.trim())
+  if (cachedEntry) {
+    await useCachedVideo(cachedEntry)
+    return
+  }
+
   ytFetching.value = true
   ytError.value = ''
   ytPhase.value = 'metadata'
@@ -145,6 +232,7 @@ async function fetchYoutube() {
     let fileId = ''
     let fileName = ''
     let doneTitle = ''
+    let doneThumbnail = ''
 
     while (true) {
       const { done, value } = await reader.read()
@@ -177,6 +265,7 @@ async function fetchYoutube() {
               fileId = data.fileId
               fileName = data.fileName || 'youtube.m4a'
               doneTitle = data.title || ''
+              doneThumbnail = data.thumbnail || ''
             } else if (currentEvent === 'error') {
               ytError.value = data.message || 'YouTube fetch failed'
             }
@@ -189,6 +278,15 @@ async function fetchYoutube() {
 
     // Download the file if we got a fileId
     if (fileId && !ytError.value) {
+      // Add to cache
+      addToYtCache({
+        fileId,
+        url: youtubeUrl.value.trim(),
+        title: doneTitle,
+        thumbnail: doneThumbnail,
+        fileName,
+      })
+
       const dlResp = await fetch(`http://127.0.0.1:8765/api/youtube/download/${fileId}`)
       if (!dlResp.ok) throw new Error('Failed to download audio file')
       const blob = await dlResp.blob()
@@ -212,6 +310,9 @@ function loadAudio(file: File) {
   previewLoading.value = true
   cutRegions.value = []
   selectedRegionId.value = null
+  pendingRegion.value = null
+  speakerData.value = []
+  diarizeError.value = ''
 
   const reader = new FileReader()
   reader.onload = (e) => {
@@ -231,8 +332,9 @@ function loadAudio(file: File) {
         audioBuffer.value = buffer
         previewDuration.value = buffer.duration
         previewLoading.value = false
-        waveformPeaks = computePeaks(buffer, 600)
-        nextTick(() => drawWaveform())
+        waveformPeaks = computePeaks(buffer, peakBuckets())
+        nextTick(() => { drawWaveform(); drawMinimap() })
+        if (autoDetectSpeakers.value) detectSpeakers()
       })
       .catch(() => { previewLoading.value = false })
   }
@@ -244,12 +346,181 @@ function resetState() {
   previewCurrentTime.value = 0
   previewIsPlaying.value = false
   previewPlayheadPos.value = 0
+  seekOriginPos.value = null
   previewOffsetSec = 0
   previewStartedAt = 0
   volumeGain.value = 1.0
   waveformPeaks = null
   actionMessage.value = ''
   actionError.value = ''
+  zoomLevel.value = 1
+  viewStart.value = 0
+}
+
+// ── Speaker diarization ─────────────────────────────────────────────────────
+async function detectSpeakers() {
+  if (!audioFile.value && !audioBuffer.value) return
+  diarizing.value = true
+  diarizeError.value = ''
+  speakerData.value = []
+
+  try {
+    // Build WAV blob from current audioBuffer (may have been cropped)
+    let blob: Blob
+    if (audioBuffer.value) {
+      blob = audioBufferToWav(audioBuffer.value, 1.0)
+    } else {
+      blob = audioFile.value!
+    }
+
+    const formData = new FormData()
+    formData.append('file', blob, 'audio.wav')
+
+    const resp = await fetch('http://127.0.0.1:8765/api/diarize', {
+      method: 'POST',
+      body: formData,
+    })
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => null)
+      throw new Error(err?.error || `Server error ${resp.status}`)
+    }
+
+    const data = await resp.json()
+    speakerData.value = data.speakers || []
+    nextTick(() => drawSpeakerBar())
+  } catch (err: any) {
+    diarizeError.value = err.message || 'Diarization failed'
+  } finally {
+    diarizing.value = false
+  }
+}
+
+function drawSpeakerBar() {
+  const canvasEl = speakerBarCanvasRef.value
+  if (!canvasEl || !speakerData.value.length || !previewDuration.value) return
+
+  const dpr = window.devicePixelRatio || 1
+  const rect = canvasEl.getBoundingClientRect()
+  canvasEl.width = rect.width * dpr
+  canvasEl.height = rect.height * dpr
+
+  const ctx = canvasEl.getContext('2d')
+  if (!ctx) return
+  ctx.scale(dpr, dpr)
+
+  const W = rect.width
+  const H = rect.height
+  const duration = previewDuration.value
+  const vStart = viewStart.value
+  const vSpan = viewSpan.value
+
+  ctx.clearRect(0, 0, W, H)
+
+  for (let si = 0; si < speakerData.value.length; si++) {
+    const speaker = speakerData.value[si]
+    const color = SPEAKER_COLORS[si % SPEAKER_COLORS.length]
+
+    for (const seg of speaker.segments) {
+      const segStartFrac = seg.start / duration
+      const segEndFrac = seg.end / duration
+
+      // Map to viewport
+      const x1 = (segStartFrac - vStart) / vSpan * W
+      const x2 = (segEndFrac - vStart) / vSpan * W
+
+      if (x2 < 0 || x1 > W) continue // off-screen
+
+      const drawX = Math.max(0, x1)
+      const drawW = Math.min(W, x2) - drawX
+
+      ctx.fillStyle = color
+      ctx.globalAlpha = 0.7
+      ctx.beginPath()
+      ctx.roundRect(drawX, 1, Math.max(drawW, 1), H - 2, 2)
+      ctx.fill()
+    }
+  }
+  ctx.globalAlpha = 1.0
+}
+
+// ── Zoom & pan helpers ──────────────────────────────────────────────────────
+function viewportToFrac(vp: number): number {
+  // Convert viewport-relative fraction (0-1) to full-audio fraction (0-1)
+  return viewStart.value + vp * viewSpan.value
+}
+
+function viewportToCollapsedFrac(vp: number): number {
+  // Convert viewport-relative fraction to collapsed fraction (for zoom anchoring)
+  return viewStart.value + vp * viewSpan.value
+}
+
+function clampViewStart() {
+  const maxStart = Math.max(0, 1 - viewSpan.value)
+  viewStart.value = Math.max(0, Math.min(maxStart, viewStart.value))
+}
+
+function zoomAt(newZoom: number, anchorFrac: number) {
+  // Zoom centered on anchorFrac (full-audio 0-1 fraction)
+  const oldSpan = viewSpan.value
+  const oldOffset = anchorFrac - viewStart.value
+  const anchorRatio = oldOffset / oldSpan // where anchor is in viewport (0-1)
+
+  const oldBuckets = peakBuckets()
+  zoomLevel.value = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom))
+  const newBuckets = peakBuckets()
+  const newSpan = 1 / zoomLevel.value
+  viewStart.value = anchorFrac - anchorRatio * newSpan
+  clampViewStart()
+
+  // Recompute peaks at higher resolution when zoom changes enough
+  if (newBuckets !== oldBuckets) recomputePeaks()
+
+  drawWaveform()
+  // Minimap canvas may not exist yet if we just zoomed in, wait for DOM
+  nextTick(() => drawMinimap())
+}
+
+function zoomIn() {
+  const center = viewStart.value + viewSpan.value / 2
+  zoomAt(zoomLevel.value * 1.5, center)
+}
+
+function zoomOut() {
+  const center = viewStart.value + viewSpan.value / 2
+  zoomAt(zoomLevel.value / 1.5, center)
+}
+
+function zoomReset() {
+  zoomLevel.value = 1
+  viewStart.value = 0
+  recomputePeaks()
+  drawWaveform()
+  drawMinimap()
+}
+
+function onWaveformWheel(event: WheelEvent) {
+  if (!audioBuffer.value) return
+  event.preventDefault()
+
+  const canvasEl = waveformCanvasRef.value
+  if (!canvasEl) return
+  const rect = canvasEl.getBoundingClientRect()
+  const cursorViewportFrac = (event.clientX - rect.left) / rect.width
+  const cursorFrac = viewportToCollapsedFrac(cursorViewportFrac)
+
+  if (event.shiftKey) {
+    // Shift+wheel = pan
+    const panAmount = viewSpan.value * 0.1 * Math.sign(event.deltaY)
+    viewStart.value += panAmount
+    clampViewStart()
+    drawWaveform()
+    drawMinimap()
+  } else {
+    // Regular wheel = zoom
+    const factor = event.deltaY < 0 ? 1.25 : 1 / 1.25
+    zoomAt(zoomLevel.value * factor, cursorFrac)
+  }
 }
 
 function destroyAudio() {
@@ -262,9 +533,25 @@ function destroyAudio() {
   frequencyData = null
   frequencyPeaks = null
   removeDragListeners()
+  if (middlePanMoveBound) { document.removeEventListener('mousemove', middlePanMoveBound); middlePanMoveBound = null }
+  if (middlePanEndBound) { document.removeEventListener('mouseup', middlePanEndBound); middlePanEndBound = null }
+  middleMousePanning.value = false
 }
 
 // ── Waveform peaks ───────────────────────────────────────────────────────────
+const BASE_PEAKS = 600
+
+function peakBuckets(): number {
+  // Scale bucket count with zoom so bars stay ~the same pixel width
+  return Math.min(Math.round(BASE_PEAKS * zoomLevel.value), 20000)
+}
+
+function recomputePeaks() {
+  if (audioBuffer.value) {
+    waveformPeaks = computePeaks(audioBuffer.value, peakBuckets())
+  }
+}
+
 function computePeaks(buffer: AudioBuffer, numBuckets: number): Float32Array {
   const numChannels = buffer.numberOfChannels
   const totalSamples = buffer.length
@@ -309,68 +596,123 @@ function drawWaveform() {
   ctx.fillStyle = 'rgba(0,0,0,0.2)'
   ctx.fillRect(0, 0, W, H)
 
-  const barW = W / n
   const midY = H / 2
+  const vStart = viewStart.value
+  const vSpan = viewSpan.value
 
-  // Pre-compute which fractions are in cut regions
-  for (let i = 0; i < n; i++) {
-    const x = i * barW
-    const frac = i / n
-    const barH = Math.min(peaks[i] * volumeGain.value * midY * 0.95, midY)
+  // Always draw full waveform — cut regions are shown as DOM overlays
+  {
+    const startIdx = Math.max(0, Math.floor(vStart * n))
+    const endIdx = Math.min(n, Math.ceil((vStart + vSpan) * n))
 
-    const isCut = isInCutRegion(frac)
-    if (isCut) {
-      ctx.fillStyle = 'rgba(231, 76, 60, 0.25)'
-    } else {
-      // Purple-to-orange gradient for kept regions
+    const rawBarW = W / (vSpan * n)
+    const maxBarPx = 3 // cap bar width so waveform stays granular
+    const barW = Math.min(rawBarW, maxBarPx)
+    const gap = rawBarW > maxBarPx ? (rawBarW - maxBarPx) / 2 : 0
+
+    for (let i = startIdx; i < endIdx; i++) {
+      const frac = i / n
+      const x = (frac - vStart) / vSpan * W + gap
+      const barH = Math.min(peaks[i] * volumeGain.value * midY * 0.95, midY)
+
       const t = frac
       const r = Math.round(155 + (231 - 155) * t)
       const g = Math.round(89 + (76 - 89) * t)
       const b = Math.round(182 + (60 - 182) * t)
       ctx.fillStyle = `rgba(${r},${g},${b},0.85)`
-    }
 
-    ctx.fillRect(x, midY - barH, Math.max(barW - 0.5, 0.5), barH * 2)
+      ctx.fillRect(x, midY - barH, Math.max(barW - 0.5, 0.5), barH * 2)
+    }
   }
 
-  // Draw cut region overlays with hatching
-  const merged = mergedCutRegions.value
-  for (const region of merged) {
-    const x1 = region.start * W
-    const x2 = region.end * W
-    ctx.fillStyle = 'rgba(231, 76, 60, 0.08)'
-    ctx.fillRect(x1, 0, x2 - x1, H)
+  // Draw time scale when zoomed in
+  if (zoomLevel.value > 1.5) {
+    drawTimeScale(ctx, W, H, vStart, vSpan)
+  }
 
-    // Top/bottom border lines for cut regions
-    ctx.strokeStyle = 'rgba(231, 76, 60, 0.4)'
-    ctx.lineWidth = 1
-    ctx.beginPath()
-    ctx.moveTo(x1, 0); ctx.lineTo(x2, 0)
-    ctx.moveTo(x1, H); ctx.lineTo(x2, H)
-    ctx.stroke()
+  // Draw seek origin marker
+  if (seekOriginPos.value !== null && previewIsPlaying.value) {
+    const originPx = (seekOriginPos.value - vStart) / vSpan * W
+    if (originPx >= -5 && originPx <= W + 5) {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.25)'
+      ctx.fillRect(originPx - 0.5, 0, 1, H)
+      // Small diamond marker
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.4)'
+      ctx.beginPath()
+      ctx.moveTo(originPx, H - 10)
+      ctx.lineTo(originPx + 4, H - 5)
+      ctx.lineTo(originPx, H)
+      ctx.lineTo(originPx - 4, H - 5)
+      ctx.closePath()
+      ctx.fill()
+    }
   }
 
   // Draw playhead
   if (previewIsPlaying.value || previewPlayheadPos.value > 0) {
-    const px = previewPlayheadPos.value * W
-    ctx.fillStyle = '#fff'
-    ctx.fillRect(px - 1, 0, 2, H)
-    // Triangle
-    ctx.beginPath()
-    ctx.moveTo(px - 5, 0)
-    ctx.lineTo(px + 5, 0)
-    ctx.lineTo(px, 7)
-    ctx.closePath()
-    ctx.fill()
+    const px = (previewPlayheadPos.value - vStart) / vSpan * W
+    if (px >= -5 && px <= W + 5) {
+      ctx.fillStyle = '#fff'
+      ctx.fillRect(px - 1, 0, 2, H)
+      // Triangle
+      ctx.beginPath()
+      ctx.moveTo(px - 5, 0)
+      ctx.lineTo(px + 5, 0)
+      ctx.lineTo(px, 7)
+      ctx.closePath()
+      ctx.fill()
+    }
+  }
+
+  // Update speaker bar whenever waveform redraws
+  drawSpeakerBar()
+}
+
+function drawTimeScale(ctx: CanvasRenderingContext2D, W: number, H: number, vStart: number, vSpan: number) {
+  if (!previewDuration.value) return
+  const duration = previewDuration.value
+
+  const visibleDurationEst = vSpan * duration
+
+  // Choose a nice tick interval based on visible duration
+  const targetTicks = 8
+  const rawInterval = visibleDurationEst / targetTicks
+  const niceIntervals = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60]
+  let tickInterval = niceIntervals[niceIntervals.length - 1]
+  for (const ni of niceIntervals) {
+    if (ni >= rawInterval) { tickInterval = ni; break }
+  }
+
+  ctx.font = '9px monospace'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'bottom'
+
+  const visibleStartSec = vStart * duration
+  const visibleEndSec = (vStart + vSpan) * duration
+  const firstTick = Math.ceil(visibleStartSec / tickInterval) * tickInterval
+  for (let t = firstTick; t <= visibleEndSec; t += tickInterval) {
+    const frac = t / duration
+    const x = (frac - vStart) / vSpan * W
+    if (x < 0 || x > W) continue
+    drawTimeTick(ctx, x, t, tickInterval, W, H)
   }
 }
 
-function isInCutRegion(frac: number): boolean {
-  for (const r of cutRegions.value) {
-    if (frac >= r.start && frac <= r.end) return true
-  }
-  return false
+function drawTimeTick(ctx: CanvasRenderingContext2D, x: number, t: number, tickInterval: number, _W: number, H: number) {
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)'
+  ctx.lineWidth = 1
+  ctx.beginPath()
+  ctx.moveTo(x, H - 12)
+  ctx.lineTo(x, H)
+  ctx.stroke()
+
+  const label = tickInterval < 1
+    ? `${t.toFixed(tickInterval < 0.1 ? 2 : 1)}s`
+    : formatTime(t)
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.35)'
+  ctx.fillText(label, x, H - 1)
 }
+
 
 // ── Frequency scope ──────────────────────────────────────────────────────────
 function drawFrequencyScope() {
@@ -504,6 +846,7 @@ function startPlayback() {
       previewOffsetSec = 0
       previewCurrentTime.value = 0
       previewPlayheadPos.value = 0
+      seekOriginPos.value = null
       drawWaveform()
       startPeakDecay()
     }
@@ -542,6 +885,7 @@ function scheduleAnimation() {
     previewPlayheadPos.value = previewDuration.value > 0 ? currentSec / previewDuration.value : 0
     drawWaveform()
     drawFrequencyScope()
+    drawMinimap()
     animFrame = requestAnimationFrame(tick)
   }
   animFrame = requestAnimationFrame(tick)
@@ -608,21 +952,191 @@ function drawFrequencyScopeStatic() {
   drawFrequencyScale(ctx, W, specH, maxFreq)
 }
 
+// ── Minimap ─────────────────────────────────────────────────────────────────
+function drawMinimap() {
+  const canvasEl = minimapCanvasRef.value
+  if (!canvasEl || !waveformPeaks) return
+
+  const dpr = window.devicePixelRatio || 1
+  const rect = canvasEl.getBoundingClientRect()
+  canvasEl.width = rect.width * dpr
+  canvasEl.height = rect.height * dpr
+
+  const ctx = canvasEl.getContext('2d')
+  if (!ctx) return
+  ctx.scale(dpr, dpr)
+
+  const W = rect.width
+  const H = rect.height
+  const peaks = waveformPeaks
+  const n = peaks.length
+  const midY = H / 2
+
+  ctx.clearRect(0, 0, W, H)
+  ctx.fillStyle = 'rgba(0,0,0,0.3)'
+  ctx.fillRect(0, 0, W, H)
+
+  // Always draw full waveform on minimap
+  const barW = W / n
+  for (let i = 0; i < n; i++) {
+    const barH = Math.min(peaks[i] * volumeGain.value * midY * 0.9, midY)
+    ctx.fillStyle = 'rgba(155, 89, 182, 0.5)'
+    ctx.fillRect(i * barW, midY - barH, Math.max(barW - 0.3, 0.3), barH * 2)
+  }
+
+  // Draw pending cut region on minimap
+  if (pendingRegion.value) {
+    const rx = pendingRegion.value.start * W
+    const rw = (pendingRegion.value.end - pendingRegion.value.start) * W
+    ctx.fillStyle = 'rgba(231, 76, 60, 0.3)'
+    ctx.fillRect(rx, 0, rw, H)
+  }
+
+  // Draw viewport indicator
+  const vx = viewStart.value * W
+  const vw = viewSpan.value * W
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)'
+  ctx.fillRect(0, 0, vx, H)
+  ctx.fillRect(vx + vw, 0, W - vx - vw, H)
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)'
+  ctx.lineWidth = 1.5
+  ctx.strokeRect(vx + 0.5, 0.5, vw - 1, H - 1)
+
+  // Seek origin on minimap
+  if (seekOriginPos.value !== null && previewIsPlaying.value) {
+    const opx = seekOriginPos.value * W
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.3)'
+    ctx.fillRect(opx - 0.5, 0, 1, H)
+  }
+
+  // Playhead on minimap
+  if (previewIsPlaying.value || previewPlayheadPos.value > 0) {
+    const px = previewPlayheadPos.value * W
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.8)'
+    ctx.fillRect(px - 0.5, 0, 1, H)
+  }
+}
+
+let minimapDragging = false
+function onMinimapMousedown(event: MouseEvent) {
+  const canvasEl = minimapCanvasRef.value
+  if (!canvasEl) return
+  event.preventDefault()
+  minimapDragging = true
+
+  const rect = canvasEl.getBoundingClientRect()
+  const frac = (event.clientX - rect.left) / rect.width
+  // Center viewport on click position
+  viewStart.value = frac - viewSpan.value / 2
+  clampViewStart()
+  drawWaveform()
+  drawMinimap()
+
+  const onMove = (e: MouseEvent) => {
+    if (!minimapDragging) return
+    const f = (e.clientX - rect.left) / rect.width
+    viewStart.value = f - viewSpan.value / 2
+    clampViewStart()
+    drawWaveform()
+    drawMinimap()
+  }
+  const onUp = () => {
+    minimapDragging = false
+    document.removeEventListener('mousemove', onMove)
+    document.removeEventListener('mouseup', onUp)
+  }
+  document.addEventListener('mousemove', onMove)
+  document.addEventListener('mouseup', onUp)
+}
+
 // ── Waveform click / seek ────────────────────────────────────────────────────
+function onWaveformMiddleMousedown(event: MouseEvent) {
+  if (event.button !== 1) return
+  event.preventDefault()
+  if (!audioBuffer.value || zoomLevel.value <= 1) return
+
+  const canvasEl = waveformCanvasRef.value
+  if (!canvasEl) return
+
+  middleMousePanning.value = true
+  const startX = event.clientX
+  const startViewStart = viewStart.value
+  const rect = canvasEl.getBoundingClientRect()
+
+  if (middlePanMoveBound) document.removeEventListener('mousemove', middlePanMoveBound)
+  if (middlePanEndBound) document.removeEventListener('mouseup', middlePanEndBound)
+
+  middlePanMoveBound = (e: MouseEvent) => {
+    const dx = e.clientX - startX
+    const fracDelta = -(dx / rect.width) * viewSpan.value
+    viewStart.value = startViewStart + fracDelta
+    clampViewStart()
+    drawWaveform()
+    drawMinimap()
+  }
+
+  middlePanEndBound = () => {
+    middleMousePanning.value = false
+    if (middlePanMoveBound) { document.removeEventListener('mousemove', middlePanMoveBound); middlePanMoveBound = null }
+    if (middlePanEndBound) { document.removeEventListener('mouseup', middlePanEndBound); middlePanEndBound = null }
+  }
+
+  document.addEventListener('mousemove', middlePanMoveBound)
+  document.addEventListener('mouseup', middlePanEndBound)
+}
+
 function onWaveformMousedown(event: MouseEvent) {
+  if (event.button !== 0) return // only left click
   const canvasEl = waveformCanvasRef.value
   if (!canvasEl || !audioBuffer.value) return
   const rect = canvasEl.getBoundingClientRect()
-  const frac = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
 
-  // Check if clicking near a cut region handle
-  const handleHit = findHandleAt(frac)
-  if (handleHit) {
-    startHandleDrag(event, handleHit.regionId, handleHit.handle)
-    return
+  const startX = event.clientX
+  const startViewportFrac = Math.max(0, Math.min(1, (startX - rect.left) / rect.width))
+  const startFrac = viewportToFrac(startViewportFrac)
+  let dragging = false
+
+  removeDragListeners()
+
+  // Cancel any existing pending region when starting a new drag
+  if (pendingRegion.value) {
+    pendingRegion.value = null
   }
 
-  seekTo(frac * previewDuration.value)
+  dragMoveBound = (e: MouseEvent) => {
+    const dx = Math.abs(e.clientX - startX)
+    if (dx < 4) return // dead zone before starting drag
+
+    dragging = true
+    const currentViewportFrac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+    const currentFrac = Math.max(0, Math.min(1, viewportToFrac(currentViewportFrac)))
+    const regionStart = Math.min(startFrac, currentFrac)
+    const regionEnd = Math.max(startFrac, currentFrac)
+
+    if (!pendingRegion.value) {
+      pendingRegion.value = {
+        id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+        start: regionStart,
+        end: regionEnd,
+      }
+    } else {
+      pendingRegion.value.start = regionStart
+      pendingRegion.value.end = regionEnd
+    }
+    drawWaveform()
+    drawMinimap()
+  }
+
+  dragEndBound = () => {
+    removeDragListeners()
+    if (!dragging) {
+      // Barely moved — treat as seek click
+      seekTo(startFrac * previewDuration.value)
+    }
+  }
+
+  document.addEventListener('mousemove', dragMoveBound)
+  document.addEventListener('mouseup', dragEndBound)
 }
 
 function seekTo(timeSec: number) {
@@ -631,87 +1145,139 @@ function seekTo(timeSec: number) {
   previewOffsetSec = Math.max(0, Math.min(previewDuration.value, timeSec))
   previewCurrentTime.value = previewOffsetSec
   previewPlayheadPos.value = previewDuration.value > 0 ? previewOffsetSec / previewDuration.value : 0
+  seekOriginPos.value = previewPlayheadPos.value
   drawWaveform()
+  drawMinimap()
   if (wasPlaying) startPlayback()
 }
 
 // ── Cut region management ────────────────────────────────────────────────────
 function addCutRegion() {
-  // Add a new cut region centered on the current playhead position
-  const center = previewPlayheadPos.value || 0.5
-  const halfWidth = 0.05
-  const region: CutRegion = {
+  // Create a pending cut region starting from the current playhead position
+  if (pendingRegion.value) return // already have a pending region
+  const start = previewPlayheadPos.value || 0
+  const width = 0.1
+  pendingRegion.value = {
     id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
-    start: Math.max(0, center - halfWidth),
-    end: Math.min(1, center + halfWidth),
-  }
-  cutRegions.value.push(region)
-  selectedRegionId.value = region.id
-  drawWaveform()
-}
-
-function removeCutRegion(id: string) {
-  cutRegions.value = cutRegions.value.filter(r => r.id !== id)
-  if (selectedRegionId.value === id) selectedRegionId.value = null
-  drawWaveform()
-}
-
-function removeAllCutRegions() {
-  cutRegions.value = []
-  selectedRegionId.value = null
-  drawWaveform()
-}
-
-function selectRegion(id: string) {
-  selectedRegionId.value = selectedRegionId.value === id ? null : id
-}
-
-// ── Handle dragging ──────────────────────────────────────────────────────────
-function findHandleAt(frac: number): { regionId: string; handle: 'start' | 'end' } | null {
-  const threshold = 0.01 // 1% of total width
-  for (const r of cutRegions.value) {
-    if (Math.abs(frac - r.start) < threshold) return { regionId: r.id, handle: 'start' }
-    if (Math.abs(frac - r.end) < threshold) return { regionId: r.id, handle: 'end' }
-  }
-  return null
-}
-
-function startHandleDrag(event: MouseEvent, regionId: string, handle: 'start' | 'end') {
-  event.preventDefault()
-  event.stopPropagation()
-  dragState.value = { regionId, handle }
-  selectedRegionId.value = regionId
-
-  dragMoveBound = (e: MouseEvent) => onDragMove(e)
-  dragEndBound = () => onDragEnd()
-  document.addEventListener('mousemove', dragMoveBound)
-  document.addEventListener('mouseup', dragEndBound)
-}
-
-function onHandleMousedown(event: MouseEvent, regionId: string, handle: 'start' | 'end') {
-  startHandleDrag(event, regionId, handle)
-}
-
-function onDragMove(event: MouseEvent) {
-  const canvasEl = waveformCanvasRef.value
-  if (!canvasEl || !dragState.value) return
-  const rect = canvasEl.getBoundingClientRect()
-  const frac = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
-
-  const region = cutRegions.value.find(r => r.id === dragState.value!.regionId)
-  if (!region) return
-
-  if (dragState.value.handle === 'start') {
-    region.start = Math.min(frac, region.end - 0.005)
-  } else {
-    region.end = Math.max(frac, region.start + 0.005)
+    start: Math.max(0, start),
+    end: Math.min(1, start + width),
   }
   drawWaveform()
+  drawMinimap()
 }
 
-function onDragEnd() {
-  dragState.value = null
-  removeDragListeners()
+function applyPendingCut() {
+  if (!pendingRegion.value || !audioBuffer.value || !audioCtx) return
+
+  const wasPlaying = previewIsPlaying.value
+  if (wasPlaying) stopPlayback()
+
+  const buf = audioBuffer.value
+  const sampleRate = buf.sampleRate
+  const numChannels = buf.numberOfChannels
+  const cutStart = Math.floor(pendingRegion.value.start * buf.length)
+  const cutEnd = Math.ceil(pendingRegion.value.end * buf.length)
+  const newLength = buf.length - (cutEnd - cutStart)
+
+  if (newLength <= 0) {
+    pendingRegion.value = null
+    return
+  }
+
+  // Build new buffer without the cut section
+  const newBuffer = audioCtx.createBuffer(numChannels, newLength, sampleRate)
+  for (let ch = 0; ch < numChannels; ch++) {
+    const src = buf.getChannelData(ch)
+    const dst = newBuffer.getChannelData(ch)
+    dst.set(src.subarray(0, cutStart), 0)
+    dst.set(src.subarray(cutEnd), cutStart)
+  }
+
+  // Update playhead to stay in a valid position
+  const cutStartFrac = pendingRegion.value.start
+  const cutEndFrac = pendingRegion.value.end
+  const cutWidth = cutEndFrac - cutStartFrac
+
+  let newPlayheadFrac = previewPlayheadPos.value
+  if (newPlayheadFrac >= cutEndFrac) {
+    newPlayheadFrac -= cutWidth
+  } else if (newPlayheadFrac > cutStartFrac) {
+    newPlayheadFrac = cutStartFrac
+  }
+  // Normalize to new duration
+  const newDuration = newBuffer.duration
+  newPlayheadFrac = Math.max(0, Math.min(1, newPlayheadFrac / (1 - cutWidth)))
+
+  // Track the cut for display purposes
+  cutRegions.value.push({ ...pendingRegion.value })
+  pendingRegion.value = null
+
+  // Adjust view window: the audio shrank, so shift viewStart to account for removed section
+  if (viewStart.value > cutStartFrac) {
+    viewStart.value = Math.max(0, viewStart.value - cutWidth)
+  }
+  clampViewStart()
+
+  // Apply new buffer
+  audioBuffer.value = newBuffer
+  previewDuration.value = newDuration
+  previewPlayheadPos.value = newPlayheadFrac
+  previewCurrentTime.value = newPlayheadFrac * newDuration
+  previewOffsetSec = previewCurrentTime.value
+  waveformPeaks = computePeaks(newBuffer, peakBuckets())
+
+  // ── Adjust speaker segments to match the cropped audio ──────────────
+  if (speakerData.value.length) {
+    const oldDuration = buf.duration
+    const cutStartSec = cutStartFrac * oldDuration
+    const cutEndSec = cutEndFrac * oldDuration
+    const cutDuration = cutEndSec - cutStartSec
+
+    speakerData.value = speakerData.value.map(speaker => {
+      const adjusted = speaker.segments
+        .map(seg => {
+          let s = seg.start
+          let e = seg.end
+          // Segment entirely within the cut — remove it
+          if (s >= cutStartSec && e <= cutEndSec) return null
+          // Segment overlaps cut start — trim end to cut boundary
+          if (s < cutStartSec && e > cutStartSec && e <= cutEndSec) {
+            e = cutStartSec
+          }
+          // Segment overlaps cut end — trim start to cut boundary
+          else if (s >= cutStartSec && s < cutEndSec && e > cutEndSec) {
+            s = cutEndSec
+          }
+          // Segment spans entire cut — shrink by cut duration
+          else if (s < cutStartSec && e > cutEndSec) {
+            e -= cutDuration
+          }
+          // Shift segments after the cut
+          if (s >= cutEndSec) {
+            s -= cutDuration
+            e -= cutDuration
+          } else if (e > cutStartSec && s < cutStartSec) {
+            // already trimmed above, no shift needed for start
+          }
+          return { start: Math.round(s * 100) / 100, end: Math.round(e * 100) / 100 }
+        })
+        .filter((seg): seg is SpeakerSegment => seg !== null && seg.end > seg.start)
+      return { ...speaker, segments: adjusted }
+    }).filter(speaker => speaker.segments.length > 0)
+
+    nextTick(() => drawSpeakerBar())
+  }
+
+  drawWaveform()
+  drawMinimap()
+
+  if (wasPlaying) startPlayback()
+}
+
+function cancelPendingCut() {
+  pendingRegion.value = null
+  drawWaveform()
+  drawMinimap()
 }
 
 function removeDragListeners() {
@@ -719,50 +1285,84 @@ function removeDragListeners() {
   if (dragEndBound) { document.removeEventListener('mouseup', dragEndBound); dragEndBound = null }
 }
 
+// ── Cut overlay positioning helpers ──────────────────────────────────────────
+function cutOverlayStyle(region: CutRegion) {
+  const vStart = viewStart.value
+  const vSpan = viewSpan.value
+  const left = (region.start - vStart) / vSpan * 100
+  const right = (region.end - vStart) / vSpan * 100
+  return {
+    left: `${Math.max(0, left)}%`,
+    width: `${Math.min(100, right) - Math.max(0, left)}%`,
+  }
+}
+
+function cutHandleX(frac: number): string {
+  const vStart = viewStart.value
+  const vSpan = viewSpan.value
+  return `${(frac - vStart) / vSpan * 100}%`
+}
+
+function startHandleDrag(_regionId: string, edge: 'start' | 'end', _event: MouseEvent) {
+  const canvasEl = waveformCanvasRef.value
+  if (!canvasEl || !pendingRegion.value) return
+  const rect = canvasEl.getBoundingClientRect()
+
+  removeDragListeners()
+
+  dragMoveBound = (e: MouseEvent) => {
+    if (!pendingRegion.value) return
+    const viewportFrac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+    const frac = viewStart.value + viewportFrac * viewSpan.value
+    const clamped = Math.max(0, Math.min(1, frac))
+
+    if (edge === 'start') {
+      pendingRegion.value.start = Math.min(clamped, pendingRegion.value.end - 0.0001)
+    } else {
+      pendingRegion.value.end = Math.max(clamped, pendingRegion.value.start + 0.0001)
+    }
+    drawWaveform()
+    drawMinimap()
+  }
+
+  dragEndBound = () => {
+    removeDragListeners()
+  }
+
+  document.addEventListener('mousemove', dragMoveBound)
+  document.addEventListener('mouseup', dragEndBound)
+}
+
 // ── Keyboard controls ────────────────────────────────────────────────────────
 function onKeydown(event: KeyboardEvent) {
   if (event.code === 'Space') {
     event.preventDefault()
     togglePlayback()
+  } else if (event.key === '=' || event.key === '+') {
+    event.preventDefault()
+    zoomIn()
+  } else if (event.key === '-') {
+    event.preventDefault()
+    zoomOut()
+  } else if (event.key === '0') {
+    event.preventDefault()
+    zoomReset()
+  } else if (event.key === 'ArrowLeft' && isZoomed.value) {
+    event.preventDefault()
+    viewStart.value -= viewSpan.value * 0.2
+    clampViewStart()
+    drawWaveform()
+    drawMinimap()
+  } else if (event.key === 'ArrowRight' && isZoomed.value) {
+    event.preventDefault()
+    viewStart.value += viewSpan.value * 0.2
+    clampViewStart()
+    drawWaveform()
+    drawMinimap()
   }
 }
 
 // ── Export / crop audio ──────────────────────────────────────────────────────
-function buildCroppedBuffer(): AudioBuffer | null {
-  if (!audioBuffer.value || !audioCtx) return null
-
-  const buf = audioBuffer.value
-  const sampleRate = buf.sampleRate
-  const numChannels = buf.numberOfChannels
-  const kept = keptRegions.value
-
-  if (kept.length === 0) return null
-
-  // Calculate total kept samples
-  let totalSamples = 0
-  const segments: { startSample: number; endSample: number }[] = []
-  for (const k of kept) {
-    const startSample = Math.floor(k.start * buf.length)
-    const endSample = Math.ceil(k.end * buf.length)
-    segments.push({ startSample, endSample })
-    totalSamples += endSample - startSample
-  }
-
-  if (totalSamples <= 0) return null
-
-  const croppedBuffer = audioCtx.createBuffer(numChannels, totalSamples, sampleRate)
-  for (let ch = 0; ch < numChannels; ch++) {
-    const src = buf.getChannelData(ch)
-    const dst = croppedBuffer.getChannelData(ch)
-    let offset = 0
-    for (const seg of segments) {
-      dst.set(src.subarray(seg.startSample, seg.endSample), offset)
-      offset += seg.endSample - seg.startSample
-    }
-  }
-
-  return croppedBuffer
-}
 
 function audioBufferToWav(buffer: AudioBuffer, gain: number = 1.0): Blob {
   const numChannels = buffer.numberOfChannels
@@ -809,10 +1409,9 @@ function audioBufferToWav(buffer: AudioBuffer, gain: number = 1.0): Blob {
 }
 
 function downloadCroppedAudio() {
-  const croppedBuffer = buildCroppedBuffer()
-  if (!croppedBuffer) return
+  if (!audioBuffer.value) return
 
-  const wavBlob = audioBufferToWav(croppedBuffer, volumeGain.value)
+  const wavBlob = audioBufferToWav(audioBuffer.value, volumeGain.value)
   const name = exportName.value || 'cropped'
   const url = URL.createObjectURL(wavBlob)
   const a = document.createElement('a')
@@ -824,8 +1423,8 @@ function downloadCroppedAudio() {
 
 // ── Set as reference voice ───────────────────────────────────────────────────
 async function setAsReference() {
-  const croppedBuffer = buildCroppedBuffer()
-  if (!croppedBuffer) { actionError.value = 'No audio to export'; return }
+  if (!audioBuffer.value) { actionError.value = 'No audio to export'; return }
+  const croppedBuffer = audioBuffer.value
 
   exporting.value = true
   actionMessage.value = ''
@@ -857,8 +1456,8 @@ async function setAsReference() {
 
 // ── Use for training ─────────────────────────────────────────────────────────
 async function useForTraining() {
-  const croppedBuffer = buildCroppedBuffer()
-  if (!croppedBuffer) { actionError.value = 'No audio to export'; return }
+  if (!audioBuffer.value) { actionError.value = 'No audio to export'; return }
+  const croppedBuffer = audioBuffer.value
 
   exporting.value = true
   actionMessage.value = ''
@@ -889,47 +1488,6 @@ async function useForTraining() {
 }
 
 // ── Preview kept regions only ────────────────────────────────────────────────
-function playKeptOnly() {
-  const croppedBuffer = buildCroppedBuffer()
-  if (!croppedBuffer || !audioCtx) return
-
-  stopPlayback()
-  if (audioCtx.state === 'suspended') audioCtx.resume()
-  if (peakDecayFrame !== null) { cancelAnimationFrame(peakDecayFrame); peakDecayFrame = null }
-
-  const source = audioCtx.createBufferSource()
-  source.buffer = croppedBuffer
-  gainNode = audioCtx.createGain()
-  gainNode.gain.value = volumeGain.value
-  if (analyserNode) {
-    source.connect(gainNode)
-    gainNode.connect(analyserNode)
-    analyserNode.connect(audioCtx.destination)
-  } else {
-    source.connect(gainNode)
-    gainNode.connect(audioCtx.destination)
-  }
-  source.start(0)
-  source.onended = () => {
-    previewIsPlaying.value = false
-    startPeakDecay()
-  }
-  sourceNode = source
-  previewIsPlaying.value = true
-
-  // Simple animation for kept-only playback
-  const startTime = audioCtx.currentTime
-  const totalDur = croppedBuffer.duration
-  if (animFrame !== null) cancelAnimationFrame(animFrame)
-  const tick = () => {
-    if (!previewIsPlaying.value || !audioCtx) return
-    const elapsed = audioCtx.currentTime - startTime
-    previewCurrentTime.value = Math.min(elapsed, totalDur)
-    drawFrequencyScope()
-    animFrame = requestAnimationFrame(tick)
-  }
-  animFrame = requestAnimationFrame(tick)
-}
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 function formatTime(seconds: number): string {
@@ -947,6 +1505,8 @@ function fileNameWithoutExt(name: string): string {
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 onMounted(() => {
   lastPeakDecayTime = performance.now()
+  loadYtCache()
+  syncYtCache()
 })
 
 onUnmounted(() => {
@@ -1004,6 +1564,31 @@ onUnmounted(() => {
           <div v-if="ytTitle" class="yt-title">{{ ytTitle }}</div>
         </div>
         <div v-if="ytError" class="yt-error">{{ ytError }}</div>
+
+        <!-- YouTube cache list -->
+        <div v-if="ytCache.length" class="yt-cache">
+          <div class="yt-cache-header">Previously downloaded</div>
+          <div class="yt-cache-list">
+            <button
+              v-for="item in ytCache"
+              :key="item.fileId"
+              class="yt-cache-item"
+              @click="useCachedVideo(item)"
+              :disabled="ytFetching"
+            >
+              <img
+                v-if="item.thumbnail"
+                :src="item.thumbnail"
+                class="yt-cache-thumb"
+                alt=""
+              />
+              <div v-else class="yt-cache-thumb yt-cache-thumb-placeholder">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              </div>
+              <span class="yt-cache-title">{{ item.title || item.fileName }}</span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1021,54 +1606,74 @@ onUnmounted(() => {
         tabindex="-1"
         @keydown="onKeydown"
       >
-        <div class="waveform-container">
+        <div class="waveform-container" :class="{ 'pan-cursor': middleMousePanning }" @wheel.prevent="onWaveformWheel" @mousedown="onWaveformMousedown" @mousedown.middle="onWaveformMiddleMousedown" @auxclick.middle.prevent>
           <canvas
             ref="waveformCanvasRef"
             class="waveform-canvas"
-            @mousedown="onWaveformMousedown"
           ></canvas>
 
-          <!-- Cut region handles -->
-          <template v-for="region in cutRegions" :key="region.id">
-            <!-- Cut overlay -->
+          <!-- Pending cut region overlay -->
+          <template v-if="pendingRegion">
             <div
-              class="cut-overlay"
-              :class="{ selected: selectedRegionId === region.id }"
-              :style="{ left: (region.start * 100) + '%', width: ((region.end - region.start) * 100) + '%' }"
-              @click.stop="selectRegion(region.id)"
+              class="cut-overlay selected"
+              :style="cutOverlayStyle(pendingRegion)"
             >
-              <button class="cut-remove-btn" @click.stop="removeCutRegion(region.id)" title="Remove this cut region">x</button>
+              <button class="cut-remove-btn" style="opacity:1" @click.stop="cancelPendingCut" title="Cancel">&times;</button>
             </div>
-
-            <!-- Start handle -->
+            <!-- Left handle -->
             <div
-              class="crop-handle crop-handle-start"
-              :class="{ selected: selectedRegionId === region.id }"
-              :style="{ left: (region.start * 100) + '%' }"
-              @mousedown.stop="onHandleMousedown($event, region.id, 'start')"
+              class="crop-handle selected"
+              :style="{ left: cutHandleX(pendingRegion.start) }"
+              @mousedown.stop.prevent="startHandleDrag(pendingRegion.id, 'start', $event)"
             >
               <div class="crop-handle-line"></div>
               <div class="crop-handle-grip">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
               </div>
-              <div class="crop-handle-label">{{ formatTime(region.start * previewDuration) }}</div>
+              <span class="crop-handle-label">{{ formatTime(pendingRegion.start * previewDuration) }}</span>
             </div>
-
-            <!-- End handle -->
+            <!-- Right handle -->
             <div
-              class="crop-handle crop-handle-end"
-              :class="{ selected: selectedRegionId === region.id }"
-              :style="{ left: (region.end * 100) + '%' }"
-              @mousedown.stop="onHandleMousedown($event, region.id, 'end')"
+              class="crop-handle selected"
+              :style="{ left: cutHandleX(pendingRegion.end) }"
+              @mousedown.stop.prevent="startHandleDrag(pendingRegion.id, 'end', $event)"
             >
               <div class="crop-handle-line"></div>
               <div class="crop-handle-grip">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M16 5v14L5 12z"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
               </div>
-              <div class="crop-handle-label">{{ formatTime(region.end * previewDuration) }}</div>
+              <span class="crop-handle-label">{{ formatTime(pendingRegion.end * previewDuration) }}</span>
             </div>
           </template>
         </div>
+
+        <!-- Speaker diarization bar -->
+        <div v-if="speakerData.length" class="speaker-bar-container">
+          <canvas ref="speakerBarCanvasRef" class="speaker-bar-canvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Minimap (shown when zoomed) -->
+      <div v-if="isZoomed" class="minimap-container">
+        <canvas
+          ref="minimapCanvasRef"
+          class="minimap-canvas"
+          @mousedown="onMinimapMousedown"
+        ></canvas>
+      </div>
+
+      <!-- Zoom controls -->
+      <div class="zoom-controls">
+        <button class="zoom-btn" @click="zoomOut" :disabled="zoomLevel <= MIN_ZOOM" title="Zoom out">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+        <span class="zoom-label">{{ zoomLevel < 10 ? zoomLevel.toFixed(1) : Math.round(zoomLevel) }}x</span>
+        <button class="zoom-btn" @click="zoomIn" :disabled="zoomLevel >= MAX_ZOOM" title="Zoom in">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+        <button v-if="isZoomed" class="zoom-btn zoom-reset-btn" @click="zoomReset" title="Reset zoom">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+        </button>
       </div>
 
       <!-- Controls row -->
@@ -1084,49 +1689,78 @@ onUnmounted(() => {
           <span class="duration">{{ formatTime(previewDuration) }}</span>
         </div>
 
-        <button class="btn-secondary add-cut-btn" @click="addCutRegion" title="Add a cut region at playhead position">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 15h2V7c0-1.1-.9-2-2-2H9v2h8v8zM7 17V1H5v4H1v2h4v10c0 1.1.9 2 2 2h10v4h2v-4h4v-2H7z"/></svg>
-          Add Cut Region
-        </button>
-
-        <button v-if="cutRegions.length > 0" class="btn-secondary clear-cuts-btn" @click="removeAllCutRegions" title="Remove all cut regions">
-          Clear All
-        </button>
-
-        <div v-if="cutRegions.length > 0" class="cut-info">
-          <span>{{ cutRegions.length }} cut region{{ cutRegions.length > 1 ? 's' : '' }}</span>
-          <span class="kept-duration">Kept: {{ formatTime(keptDuration) }}</span>
-        </div>
-      </div>
-
-      <!-- Cut regions list -->
-      <div v-if="cutRegions.length > 0" class="cut-regions-list">
-        <div
-          v-for="(region, index) in sortedCutRegions"
-          :key="region.id"
-          :class="['cut-region-item', { selected: selectedRegionId === region.id }]"
-          @click="selectRegion(region.id)"
-        >
-          <span class="cut-label">Cut {{ index + 1 }}</span>
-          <span class="cut-range">{{ formatTime(region.start * previewDuration) }} – {{ formatTime(region.end * previewDuration) }}</span>
-          <span class="cut-duration">({{ formatTime((region.end - region.start) * previewDuration) }})</span>
-          <button class="cut-delete-btn" @click.stop="removeCutRegion(region.id)" title="Remove">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        <template v-if="pendingRegion">
+          <button class="btn-cut apply-cut-btn" @click="applyPendingCut" title="Cut the selected region">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9C6 7.34 7.34 6 9 6s3 1.34 3 3-1.34 3-3 3-3-1.34-3-3zM6 15c0-1.66 1.34-3 3-3s3 1.34 3 3-1.34 3-3 3-3-1.34-3-3zM20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12"/></svg>
+            Cut
           </button>
-        </div>
+          <button class="btn-secondary cancel-cut-btn" @click="cancelPendingCut" title="Cancel">
+            Cancel
+          </button>
+          <div class="cut-info">
+            <span class="pending-label">Cutting:</span>
+            <span class="cut-range">{{ formatTime(pendingRegion.start * previewDuration) }} – {{ formatTime(pendingRegion.end * previewDuration) }}</span>
+            <span class="cut-duration">({{ formatTime((pendingRegion.end - pendingRegion.start) * previewDuration) }})</span>
+          </div>
+        </template>
+
+        <template v-else>
+          <button class="btn-secondary add-cut-btn" @click="addCutRegion" title="Add a cut region at playhead position">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 15h2V7c0-1.1-.9-2-2-2H9v2h8v8zM7 17V1H5v4H1v2h4v10c0 1.1.9 2 2 2h10v4h2v-4h4v-2H7z"/></svg>
+            Add Cut Region
+          </button>
+
+          <div v-if="cutRegions.length > 0" class="cut-info">
+            <span>{{ cutRegions.length }} cut{{ cutRegions.length > 1 ? 's' : '' }} applied</span>
+            <span class="kept-duration">Duration: {{ formatTime(previewDuration) }}</span>
+          </div>
+        </template>
       </div>
 
-      <!-- Preview kept audio -->
-      <div v-if="cutRegions.length > 0" class="preview-kept-row">
-        <button class="btn-secondary preview-kept-btn" @click="playKeptOnly" :disabled="previewIsPlaying">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-          Preview Kept Audio
-        </button>
+      <!-- Speaker diarization -->
+      <div class="speaker-section">
+        <div class="speaker-controls">
+          <label class="auto-detect-toggle" title="Automatically detect speakers when audio is loaded">
+            <input
+              type="checkbox"
+              :checked="autoDetectSpeakers"
+              @change="(e: Event) => { autoDetectSpeakers = (e.target as HTMLInputElement).checked; localStorage.setItem('autoDetectSpeakers', String(autoDetectSpeakers)) }"
+            />
+            <span>Auto-detect</span>
+          </label>
+          <button
+            class="btn-secondary detect-speakers-btn"
+            @click="detectSpeakers"
+            :disabled="diarizing"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            {{ diarizing ? 'Detecting...' : speakerData.length ? 'Re-detect Speakers' : 'Detect Speakers' }}
+          </button>
+
+          <div v-if="diarizing" class="speaker-loading">
+            <div class="loading-spinner small"></div>
+            <span>Analyzing voices...</span>
+          </div>
+
+          <div v-if="diarizeError" class="speaker-error">{{ diarizeError }}</div>
+        </div>
+
+        <!-- Speaker legend -->
+        <div v-if="speakerData.length" class="speaker-legend">
+          <div
+            v-for="(speaker, idx) in speakerData"
+            :key="speaker.label"
+            class="speaker-legend-item"
+          >
+            <span class="speaker-color-dot" :style="{ background: SPEAKER_COLORS[idx % SPEAKER_COLORS.length] }"></span>
+            <span class="speaker-label">{{ speaker.label }}</span>
+          </div>
+        </div>
       </div>
 
       <!-- Hints -->
       <div class="hints">
-        Space: play/pause · Click waveform: seek · Drag red handles: adjust cut regions · Add Cut Region to mark parts to remove
+        Space: play/pause · Click: seek · Drag: create cut region · Scroll: zoom · Shift+Scroll: pan
       </div>
     </div>
 
@@ -1316,6 +1950,74 @@ onUnmounted(() => {
   font-size: 13px;
 }
 
+/* YouTube cache */
+.yt-cache {
+  margin-top: 12px;
+}
+
+.yt-cache-header {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.yt-cache-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.yt-cache-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+  text-align: left;
+  color: var(--text-primary);
+}
+
+.yt-cache-item:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.yt-cache-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.yt-cache-thumb {
+  width: 48px;
+  height: 36px;
+  border-radius: 4px;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.yt-cache-thumb-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+}
+
+.yt-cache-title {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ── Waveform card ───────────────────────────────────────────────────────── */
 .waveform-card {
   padding: 16px;
@@ -1352,11 +2054,77 @@ onUnmounted(() => {
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.waveform-container.pan-cursor {
+  cursor: grabbing;
+}
+
 .waveform-canvas {
   display: block;
   width: 100%;
   height: 100%;
   border-radius: 8px;
+}
+
+/* ── Minimap ─────────────────────────────────────────────────────────────── */
+.minimap-container {
+  width: 100%;
+  height: 32px;
+  margin-top: 6px;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.minimap-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ── Zoom controls ───────────────────────────────────────────────────────── */
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.zoom-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s;
+}
+
+.zoom-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text-primary);
+}
+
+.zoom-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.zoom-reset-btn {
+  margin-left: 4px;
+}
+
+.zoom-label {
+  font-size: 11px;
+  font-family: monospace;
+  color: var(--text-secondary);
+  min-width: 36px;
+  text-align: center;
 }
 
 /* ── Cut overlays ────────────────────────────────────────────────────────── */
@@ -1552,6 +2320,36 @@ onUnmounted(() => {
 
 .add-cut-btn svg {
   color: var(--danger);
+}
+
+.apply-cut-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  background: rgba(231, 76, 60, 0.2);
+  border: 1px solid rgba(231, 76, 60, 0.5);
+  color: var(--danger);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.apply-cut-btn:hover {
+  background: rgba(231, 76, 60, 0.35);
+  border-color: var(--danger);
+}
+
+.cancel-cut-btn {
+  padding: 6px 14px;
+  font-size: 13px;
+}
+
+.pending-label {
+  color: var(--danger);
+  font-weight: 600;
 }
 
 .clear-cuts-btn {
@@ -1776,5 +2574,105 @@ onUnmounted(() => {
   border-radius: 6px;
   color: var(--danger);
   font-size: 13px;
+}
+
+/* ── Speaker diarization ─────────────────────────────────────────────────── */
+.speaker-bar-container {
+  width: 100%;
+  height: 14px;
+  margin-top: 3px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.speaker-bar-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.speaker-section {
+  margin-top: 8px;
+}
+
+.speaker-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.auto-detect-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.auto-detect-toggle input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.detect-speakers-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  font-size: 12px;
+}
+
+.detect-speakers-btn svg {
+  color: #3498db;
+}
+
+.speaker-loading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.loading-spinner.small {
+  width: 14px;
+  height: 14px;
+  border-width: 1.5px;
+}
+
+.speaker-error {
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.speaker-legend {
+  display: flex;
+  gap: 14px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.speaker-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.speaker-color-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.speaker-label {
+  font-weight: 500;
 }
 </style>
