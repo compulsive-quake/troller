@@ -190,9 +190,9 @@ function startAudioCapture(_sampleRate: number) {
       let peak = 0;
       for (let i = 0; i < output.length; i++) {
         if (ringBuffered > 0) {
-          // Soft-clip to [-1, 1] to prevent hard clipping distortion
+          // Tanh soft-clip: gracefully compress peaks instead of hard clipping
           const raw = outputRing[ringReadPos] * vol;
-          const s = Math.max(-1, Math.min(1, raw));
+          const s = Math.abs(raw) <= 1 ? raw : Math.tanh(raw);
           output[i] = s;
           const a = Math.abs(s);
           if (a > peak) peak = a;

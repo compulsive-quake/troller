@@ -11,7 +11,7 @@ const navItems = [
   { id: "realtime", label: "Real-Time VC", icon: "mic" },
   { id: "convert", label: "Convert File", icon: "file" },
   { id: "tts", label: "Text to Speech", icon: "speaker" },
-  { id: "cropper", label: "Audio Cropper", icon: "scissors" },
+  { id: "cropper", label: "Import Audio", icon: "scissors" },
   { id: "training", label: "Training", icon: "brain" },
   { id: "models", label: "Models", icon: "box" },
   { id: "prerequisites", label: "Prerequisites", icon: "check" },

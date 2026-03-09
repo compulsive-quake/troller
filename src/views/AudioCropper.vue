@@ -396,6 +396,108 @@ async function detectSpeakers() {
   }
 }
 
+function deleteSpeakerAudio(speakerIndex: number) {
+  if (!audioBuffer.value || !audioCtx) return
+  const speaker = speakerData.value[speakerIndex]
+  if (!speaker || !speaker.segments.length) return
+
+  const wasPlaying = previewIsPlaying.value
+  if (wasPlaying) stopPlayback()
+
+  // Work on current buffer, removing segments from end to start to keep indices valid
+  let buf = audioBuffer.value
+  const duration = buf.duration
+  const sortedSegs = [...speaker.segments].sort((a, b) => b.start - a.start)
+
+  for (const seg of sortedSegs) {
+    const cutStartSample = Math.floor((seg.start / duration) * buf.length)
+    const cutEndSample = Math.min(Math.ceil((seg.end / duration) * buf.length), buf.length)
+    const newLength = buf.length - (cutEndSample - cutStartSample)
+    if (newLength <= 0) continue
+
+    const newBuf = audioCtx!.createBuffer(buf.numberOfChannels, newLength, buf.sampleRate)
+    for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+      const src = buf.getChannelData(ch)
+      const dst = newBuf.getChannelData(ch)
+      dst.set(src.subarray(0, cutStartSample), 0)
+      dst.set(src.subarray(cutEndSample), cutStartSample)
+    }
+    buf = newBuf
+  }
+
+  // Adjust all speaker data to match the new audio
+  const oldDuration = duration
+  const removedSegs = [...speaker.segments].sort((a, b) => a.start - b.start)
+
+  speakerData.value = speakerData.value
+    .filter((_, i) => i !== speakerIndex)
+    .map(sp => {
+      let adjusted = [...sp.segments]
+      // Process each removed segment from last to first
+      for (let ri = removedSegs.length - 1; ri >= 0; ri--) {
+        const rs = removedSegs[ri]
+        const cutStartSec = rs.start
+        const cutEndSec = rs.end
+        const cutDur = cutEndSec - cutStartSec
+        adjusted = adjusted
+          .map(seg => {
+            let s = seg.start, e = seg.end
+            if (s >= cutStartSec && e <= cutEndSec) return null
+            if (s < cutStartSec && e > cutStartSec && e <= cutEndSec) e = cutStartSec
+            else if (s >= cutStartSec && s < cutEndSec && e > cutEndSec) s = cutEndSec
+            else if (s < cutStartSec && e > cutEndSec) e -= cutDur
+            if (s >= cutEndSec) { s -= cutDur; e -= cutDur }
+            return { start: Math.round(s * 100) / 100, end: Math.round(e * 100) / 100 }
+          })
+          .filter((seg): seg is SpeakerSegment => seg !== null && seg.end > seg.start)
+      }
+      return { ...sp, segments: adjusted }
+    })
+    .filter(sp => sp.segments.length > 0)
+
+  // Apply
+  audioBuffer.value = buf
+  previewDuration.value = buf.duration
+  previewPlayheadPos.value = 0
+  previewCurrentTime.value = 0
+  previewOffsetSec = 0
+  waveformPeaks = computePeaks(buf, peakBuckets())
+  pendingRegion.value = null
+
+  nextTick(() => { drawWaveform(); drawMinimap(); drawSpeakerBar() })
+  if (wasPlaying) startPlayback()
+}
+
+function onSpeakerBarClick(event: MouseEvent) {
+  const canvasEl = speakerBarCanvasRef.value
+  if (!canvasEl || !speakerData.value.length || !previewDuration.value) return
+
+  const rect = canvasEl.getBoundingClientRect()
+  const clickX = (event.clientX - rect.left) / rect.width
+  // Convert viewport-relative click to full-audio fraction
+  const clickFrac = viewStart.value + clickX * viewSpan.value
+  const clickSec = clickFrac * previewDuration.value
+
+  // Find which speaker segment was clicked
+  for (const speaker of speakerData.value) {
+    for (const seg of speaker.segments) {
+      if (clickSec >= seg.start && clickSec <= seg.end) {
+        // Set this segment as the pending cut region
+        const startFrac = seg.start / previewDuration.value
+        const endFrac = seg.end / previewDuration.value
+        pendingRegion.value = {
+          id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+          start: startFrac,
+          end: endFrac,
+        }
+        drawWaveform()
+        drawMinimap()
+        return
+      }
+    }
+  }
+}
+
 function drawSpeakerBar() {
   const canvasEl = speakerBarCanvasRef.value
   if (!canvasEl || !speakerData.value.length || !previewDuration.value) return
@@ -1516,7 +1618,7 @@ onUnmounted(() => {
 
 <template>
   <div class="audio-cropper">
-    <h1 class="view-title">Audio Cropper</h1>
+    <h1 class="view-title">Import Audio</h1>
     <p class="view-subtitle">Import audio, mark regions to cut, and export clean voice for training or reference</p>
 
     <!-- Import section -->
@@ -1649,7 +1751,7 @@ onUnmounted(() => {
 
         <!-- Speaker diarization bar -->
         <div v-if="speakerData.length" class="speaker-bar-container">
-          <canvas ref="speakerBarCanvasRef" class="speaker-bar-canvas"></canvas>
+          <canvas ref="speakerBarCanvasRef" class="speaker-bar-canvas" @click="onSpeakerBarClick"></canvas>
         </div>
       </div>
 
@@ -1754,6 +1856,13 @@ onUnmounted(() => {
           >
             <span class="speaker-color-dot" :style="{ background: SPEAKER_COLORS[idx % SPEAKER_COLORS.length] }"></span>
             <span class="speaker-label">{{ speaker.label }}</span>
+            <button
+              class="speaker-delete-btn"
+              @click="deleteSpeakerAudio(idx)"
+              title="Delete all audio from this speaker"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+            </button>
           </div>
         </div>
       </div>
@@ -2591,6 +2700,7 @@ onUnmounted(() => {
   display: block;
   width: 100%;
   height: 100%;
+  cursor: pointer;
 }
 
 .speaker-section {
@@ -2674,5 +2784,32 @@ onUnmounted(() => {
 
 .speaker-label {
   font-weight: 500;
+}
+
+.speaker-delete-btn {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: all 0.15s;
+}
+
+.speaker-legend-item:hover .speaker-delete-btn {
+  opacity: 0.6;
+}
+
+.speaker-delete-btn:hover {
+  opacity: 1 !important;
+  color: var(--danger);
+  background: rgba(231, 76, 60, 0.15);
+  border-color: rgba(231, 76, 60, 0.3);
 }
 </style>

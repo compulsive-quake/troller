@@ -261,7 +261,7 @@ async def check_prerequisites():
         "name": "yt-dlp",
         "installed": yt_dlp_version is not None,
         "version": yt_dlp_version,
-        "description": "YouTube audio downloader for the Audio Cropper (optional)",
+        "description": "YouTube audio downloader for Import Audio (optional)",
         "install_hint": "Run: pip install yt-dlp",
         "auto_install": True,
         "optional": True,
@@ -308,21 +308,64 @@ async def install_prerequisite(item_id: str = Form(...)):
             return JSONResponse(status_code=400, content={"error": "requirements.txt not found"})
         from starlette.responses import StreamingResponse
 
-        async def stream_backend_install():
+        # Install steps to work around dependency conflicts:
+        # 1. pkuseg needs numpy at build time (--no-build-isolation)
+        # 2. descript-audiotools pins protobuf<3.20 which forces downgrades
+        #    and breaks onnx/nemo; install it with --no-deps to avoid that
+        # 3. Install remaining requirements normally
+        PRE_STEPS = [
+            (["--no-build-isolation", "pkuseg==0.0.25"], "Pre-installing pkuseg (no build isolation)..."),
+            (["--no-deps", "descript-audiotools>=0.7.2"], "Installing descript-audiotools (skipping deps to avoid protobuf conflict)..."),
+        ]
+        # Packages handled in pre-steps that should be skipped in the main install
+        SKIP_PKGS = {"descript-audio-codec"}
+
+        async def _pip_install(args):
+            """Run pip install, stream output lines, return exit code."""
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "pip", "install", "-r", str(req_file),
+                sys.executable, "-m", "pip", "install", *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-            async for line in proc.stdout:
-                text = line.decode(errors="replace").rstrip()
+            lines = []
+            async for raw_line in proc.stdout:
+                text = raw_line.decode(errors="replace").rstrip()
                 if text:
-                    yield f"data: {json.dumps({'stage': 'progress', 'line': text})}\n\n"
+                    lines.append(text)
             await proc.wait()
-            if proc.returncode == 0:
+            return proc.returncode, lines
+
+        async def stream_backend_install():
+            # Pre-steps: install packages that need special handling
+            for pip_args, label in PRE_STEPS:
+                yield f"data: {json.dumps({'stage': 'progress', 'line': label})}\n\n"
+                rc, lines = await _pip_install(pip_args)
+                for text in lines:
+                    yield f"data: {json.dumps({'stage': 'progress', 'line': text})}\n\n"
+                if rc != 0:
+                    yield f"data: {json.dumps({'stage': 'error', 'error': f'Failed: {label}'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+            # Main install: filter out pre-handled packages, install the rest
+            all_lines = [
+                line.strip() for line in req_file.read_text().splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            main_pkgs = []
+            for line in all_lines:
+                pkg_name = line.split(">=")[0].split("==")[0].split(">")[0].split("<")[0].split("[")[0].strip().lower()
+                if pkg_name not in SKIP_PKGS:
+                    main_pkgs.append(line)
+
+            yield f"data: {json.dumps({'stage': 'progress', 'line': 'Installing packages...'})}\n\n"
+            rc, lines = await _pip_install(main_pkgs)
+            for text in lines:
+                yield f"data: {json.dumps({'stage': 'progress', 'line': text})}\n\n"
+            if rc == 0:
                 yield f"data: {json.dumps({'stage': 'done'})}\n\n"
             else:
-                yield f"data: {json.dumps({'stage': 'error', 'error': f'pip exited with code {proc.returncode}'})}\n\n"
+                yield f"data: {json.dumps({'stage': 'error', 'error': f'pip exited with code {rc}'})}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_backend_install(), media_type="text/event-stream")
@@ -888,22 +931,28 @@ async def gpu_stats():
 
 # TTS job storage for progress tracking
 _tts_jobs: dict = {}
+_chatterbox_model = None
+
+
+def _get_chatterbox_model():
+    """Lazy-load and cache the Chatterbox TTS model."""
+    global _chatterbox_model
+    if _chatterbox_model is None:
+        from chatterbox.tts import ChatterboxTTS
+        import torch
+        device = "cuda" if cuda_enabled and torch.cuda.is_available() else "cpu"
+        _chatterbox_model = ChatterboxTTS.from_pretrained(device=device)
+    return _chatterbox_model
 
 
 @app.post("/api/tts")
 async def text_to_speech(
     text: str = Form(...),
     reference_id: str = Form(...),
-    model_id: str = Form("seed-uvit-whisper-small-wavenet"),
-    tts_voice: str = Form("en-US-GuyNeural"),
-    speed: float = Form(1.0),
-    diffusion_steps: int = Form(25),
+    exaggeration: float = Form(0.5),
+    cfg_weight: float = Form(0.5),
 ):
-    """Start TTS generation and return a job ID for progress tracking."""
-    seed_vc = get_seed_vc_path()
-    if not seed_vc:
-        return JSONResponse(status_code=400, content={"error": "seed-vc not installed. Call /api/setup first."})
-
+    """Start TTS generation with Chatterbox and return a job ID for progress tracking."""
     if not text.strip():
         return JSONResponse(status_code=400, content={"error": "Text cannot be empty"})
 
@@ -931,156 +980,76 @@ async def text_to_speech(
     _tts_jobs[job_id] = {
         "status": "running",
         "stage": "tts_generate",
-        "stage_label": "Generating base speech...",
+        "stage_label": "Loading Chatterbox model...",
         "progress": 0,
         "device": device,
         "device_name": device_name,
         "error": None,
         "output_file": None,
-        "_process": None,
     }
 
     asyncio.create_task(_run_tts_job(
-        job_id, text, ref_path, model_id, tts_voice, speed, diffusion_steps, seed_vc,
+        job_id, text, ref_path, exaggeration, cfg_weight,
     ))
 
     return {"job_id": job_id, "device": device, "device_name": device_name}
 
 
 async def _run_tts_job(
-    job_id: str, text: str, ref_path: Path, model_id: str,
-    tts_voice: str, speed: float, diffusion_steps: int, seed_vc: Path,
+    job_id: str, text: str, ref_path: Path,
+    exaggeration: float, cfg_weight: float,
 ):
-    """Run TTS pipeline in background, updating progress in _tts_jobs."""
+    """Run Chatterbox TTS in background, updating progress in _tts_jobs."""
     job = _tts_jobs[job_id]
 
-    # Stage 1: Generate base TTS audio (0-15%)
     job["stage"] = "tts_generate"
-    job["stage_label"] = "Generating base speech with edge-tts..."
+    job["stage_label"] = f"Loading Chatterbox model on {job['device_name']}..."
     job["progress"] = 5
 
-    tts_output = OUTPUT_DIR / f"tts_base_{uuid.uuid4().hex[:8]}.mp3"
-    speed_pct = int((speed - 1.0) * 100)
-    speed_str = f"+{speed_pct}%" if speed_pct >= 0 else f"{speed_pct}%"
-
     try:
-        import edge_tts
-        communicate = edge_tts.Communicate(text, tts_voice, rate=speed_str)
-        await communicate.save(str(tts_output))
-    except Exception as e:
-        job["status"] = "failed"
-        job["error"] = f"TTS generation failed: {str(e)}"
-        return
+        import torchaudio as ta
 
-    if job["status"] == "cancelled":
-        tts_output.unlink(missing_ok=True)
-        return
+        # Load model (cached after first call)
+        loop = asyncio.get_event_loop()
+        model = await loop.run_in_executor(None, _get_chatterbox_model)
 
-    if not tts_output.exists() or tts_output.stat().st_size == 0:
-        tts_output.unlink(missing_ok=True)
-        job["status"] = "failed"
-        job["error"] = "TTS produced no audio"
-        return
+        if job["status"] == "cancelled":
+            return
 
-    job["progress"] = 15
+        job["stage_label"] = f"Generating speech on {job['device_name']}..."
+        job["progress"] = 20
 
-    # Stage 2: Voice conversion with seed-vc (15-90%)
-    job["stage"] = "voice_convert"
-    job["stage_label"] = f"Loading model on {job['device_name']}..."
-    job["progress"] = 16
+        # Run inference in executor to avoid blocking the event loop
+        def _generate():
+            return model.generate(
+                text,
+                audio_prompt_path=str(ref_path),
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+            )
 
-    is_v2 = model_id.startswith("v2-")
-    script = "inference_v2.py" if is_v2 else "inference.py"
+        wav = await loop.run_in_executor(None, _generate)
 
-    custom_model_dir = MODELS_DIR / model_id
-    is_custom = custom_model_dir.exists() and (custom_model_dir / "ft_model.pth").exists()
+        if job["status"] == "cancelled":
+            return
 
-    cmd = [sys.executable, str(seed_vc / script)]
-    if is_v2:
-        cmd.extend([
-            "--source", str(tts_output),
-            "--target", str(ref_path),
-            "--output", str(OUTPUT_DIR),
-            "--intelligibility-cfg-rate", "0.7",
-            "--similarity-cfg-rate", "0.7",
-        ])
-    else:
-        cmd.extend([
-            "--source", str(tts_output),
-            "--target", str(ref_path),
-            "--output", str(OUTPUT_DIR),
-            "--diffusion-steps", str(diffusion_steps),
-            "--fp16", "True",
-        ])
-        if is_custom:
-            cmd.extend(["--checkpoint", str(custom_model_dir / "ft_model.pth")])
-            config_files = list(custom_model_dir.glob("*.yml"))
-            if config_files:
-                cmd.extend(["--config", str(config_files[0])])
+        job["stage"] = "finalizing"
+        job["stage_label"] = "Saving output..."
+        job["progress"] = 90
 
-    job["progress"] = 20
+        # Save output
+        output_name = f"tts_{job_id}.wav"
+        output_path = OUTPUT_DIR / output_name
+        ta.save(str(output_path), wav, model.sr)
 
-    if job["status"] == "cancelled":
-        tts_output.unlink(missing_ok=True)
-        return
-
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(seed_vc),
-    )
-    job["_process"] = process
-
-    # Read stderr in background to estimate progress during inference
-    inference_line_count = 0
-    async def _read_inference_progress():
-        nonlocal inference_line_count
-        while True:
-            line = await process.stderr.readline()
-            if not line:
-                break
-            text_line = line.decode(errors="replace").strip()
-            inference_line_count += 1
-            # Update progress: 20-90% range spread across inference output
-            if job["progress"] < 88:
-                # First few lines are model loading, then inference starts
-                if inference_line_count <= 3:
-                    job["stage_label"] = f"Loading model on {job['device_name']}..."
-                    job["progress"] = min(20 + inference_line_count * 3, 30)
-                else:
-                    job["stage_label"] = f"Running inference on {job['device_name']}..."
-                    # Gradually advance through the 30-88% range
-                    job["progress"] = min(30 + (inference_line_count - 3) * 3, 88)
-
-    await asyncio.gather(
-        _read_inference_progress(),
-        process.stdout.read(),
-    )
-    await process.wait()
-
-    # Clean up TTS temp file
-    tts_output.unlink(missing_ok=True)
-
-    if process.returncode != 0:
-        job["status"] = "failed"
-        job["error"] = "Voice conversion failed"
-        return
-
-    # Stage 3: Finalizing (90-100%)
-    job["stage"] = "finalizing"
-    job["stage_label"] = "Finalizing output..."
-    job["progress"] = 95
-
-    output_files = sorted(OUTPUT_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if output_files:
-        job["output_file"] = output_files[0].name
+        job["output_file"] = output_name
         job["status"] = "completed"
         job["progress"] = 100
         job["stage_label"] = "Done"
-    else:
+
+    except Exception as e:
         job["status"] = "failed"
-        job["error"] = "No output file generated"
+        job["error"] = f"TTS generation failed: {str(e)}"
 
 
 @app.get("/api/tts/status/{job_id}")
@@ -1120,12 +1089,6 @@ async def tts_cancel(job_id: str):
         return {"status": job["status"]}
     job["status"] = "cancelled"
     job["stage_label"] = "Cancelled"
-    proc = job.get("_process")
-    if proc and proc.returncode is None:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
     return {"status": "cancelled"}
 
 
@@ -1391,6 +1354,13 @@ def _get_sortformer_model():
             "nvidia/diar_sortformer_4spk-v1"
         )
         _sortformer_model.eval()
+        # Prevent Windows file locking: disable DataLoader worker subprocesses
+        # so manifest.json isn't held open during temp dir cleanup
+        if hasattr(_sortformer_model, 'cfg'):
+            from omegaconf import OmegaConf, open_dict
+            with open_dict(_sortformer_model.cfg):
+                if hasattr(_sortformer_model.cfg, 'test_ds'):
+                    _sortformer_model.cfg.test_ds.num_workers = 0
         import torch
         if torch.cuda.is_available():
             _sortformer_model = _sortformer_model.cuda()
@@ -1434,8 +1404,27 @@ async def diarize_audio(file: UploadFile = File(...)):
         # Run Sortformer diarization
         model = _get_sortformer_model()
 
-        # Run diarization and capture return value
-        diarize_result = model.diarize(audio=wav16k_path, batch_size=1)
+        # Run diarization — patch TemporaryDirectory cleanup for Windows file locking
+        import tempfile as _tempfile
+        _orig_cleanup = _tempfile.TemporaryDirectory.cleanup
+        def _safe_cleanup(self):
+            import shutil, time as _t
+            for attempt in range(5):
+                try:
+                    _orig_cleanup(self)
+                    return
+                except PermissionError:
+                    _t.sleep(0.2 * (attempt + 1))
+            # Final fallback: ignore cleanup failure on Windows
+            try:
+                shutil.rmtree(self.name, ignore_errors=True)
+            except Exception:
+                pass
+        _tempfile.TemporaryDirectory.cleanup = _safe_cleanup
+        try:
+            diarize_result = model.diarize(audio=wav16k_path, batch_size=1)
+        finally:
+            _tempfile.TemporaryDirectory.cleanup = _orig_cleanup
         print(f"[diarize] returned type={type(diarize_result).__name__}, value={diarize_result!r}")
 
         # Parse results: diarize() returns [["start end speaker", ...]]
@@ -1919,6 +1908,12 @@ class RealtimeVCSession:
 
         # 9. Resample model sr -> 16kHz for frontend
         output_16k = self.resampler_to_16k(output_wav.unsqueeze(0)).squeeze(0)
+
+        # 10. Peak-normalize to prevent clipping (vocoder can exceed [-1, 1])
+        peak = output_16k.abs().max()
+        if peak > 0.95:
+            output_16k = output_16k * (0.95 / peak)
+
         return output_16k.cpu().numpy()
 
 
@@ -1988,9 +1983,137 @@ async def realtime_voice_conversion(websocket: WebSocket):
 
 import subprocess
 import tempfile
+import time as _time
 import re as _re
 
-_yt_temp_files: dict = {}  # fileId -> { path, filename, title, created, url, thumbnail }
+# ── YouTube cache settings & helpers ──────────────────────────────────────────
+
+YT_CACHE_DIR = BASE_DIR / "yt_cache"
+YT_CACHE_DIR.mkdir(exist_ok=True)
+_YT_CACHE_INDEX = "index.json"  # metadata file inside cache dir
+
+_yt_cache_settings: dict = {
+    "cache_dir": str(YT_CACHE_DIR),
+    "max_size_mb": 128,
+    "max_items": 10,
+    "max_age_days": 7,
+}
+
+_SETTINGS_FILE = BASE_DIR / "backend" / "yt_cache_settings.json"
+
+
+def _load_yt_cache_settings():
+    """Load cache settings from disk."""
+    global _yt_cache_settings
+    if _SETTINGS_FILE.exists():
+        try:
+            with open(_SETTINGS_FILE, "r") as f:
+                saved = json.load(f)
+            _yt_cache_settings.update(saved)
+        except Exception:
+            pass
+    # Ensure cache dir exists
+    Path(_yt_cache_settings["cache_dir"]).mkdir(parents=True, exist_ok=True)
+
+
+def _save_yt_cache_settings():
+    """Persist cache settings to disk."""
+    with open(_SETTINGS_FILE, "w") as f:
+        json.dump(_yt_cache_settings, f, indent=2)
+
+
+def _get_cache_dir() -> Path:
+    return Path(_yt_cache_settings["cache_dir"])
+
+
+def _load_cache_index() -> dict:
+    """Load the cache index (fileId -> metadata) from disk."""
+    idx_path = _get_cache_dir() / _YT_CACHE_INDEX
+    if idx_path.exists():
+        try:
+            with open(idx_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_cache_index(index: dict):
+    """Write cache index to disk."""
+    idx_path = _get_cache_dir() / _YT_CACHE_INDEX
+    with open(idx_path, "w") as f:
+        json.dump(index, f, indent=2)
+
+
+def _cache_entry_path(file_id: str, filename: str) -> Path:
+    """Return path where a cached audio file lives."""
+    return _get_cache_dir() / f"{file_id}_{filename}"
+
+
+def _cleanup_yt_cache():
+    """Enforce cache policies: max age (7 days), max items (10), max size (128 MB)."""
+    index = _load_cache_index()
+    now = _time.time()
+    max_age_secs = _yt_cache_settings["max_age_days"] * 86400
+    max_size_bytes = _yt_cache_settings["max_size_mb"] * 1024 * 1024
+    max_items = _yt_cache_settings["max_items"]
+    changed = False
+
+    # 1) Remove entries older than max_age_days
+    expired = [fid for fid, e in index.items() if now - e.get("created", 0) > max_age_secs]
+    for fid in expired:
+        _delete_cache_entry(index, fid)
+        changed = True
+
+    # 2) Remove oldest entries if count exceeds max_items
+    if len(index) > max_items:
+        sorted_entries = sorted(index.items(), key=lambda x: x[1].get("created", 0))
+        while len(index) > max_items:
+            fid, _ = sorted_entries.pop(0)
+            _delete_cache_entry(index, fid)
+            changed = True
+
+    # 3) Remove oldest entries if total size exceeds max_size_mb
+    total = _calc_cache_size(index)
+    if total > max_size_bytes:
+        sorted_entries = sorted(index.items(), key=lambda x: x[1].get("created", 0))
+        while total > max_size_bytes and sorted_entries:
+            fid, entry = sorted_entries.pop(0)
+            fpath = Path(entry.get("path", ""))
+            if fpath.exists():
+                total -= fpath.stat().st_size
+            _delete_cache_entry(index, fid)
+            changed = True
+
+    if changed:
+        _save_cache_index(index)
+
+
+def _delete_cache_entry(index: dict, file_id: str):
+    """Delete a single cache entry (file + index record)."""
+    entry = index.pop(file_id, None)
+    if entry:
+        fpath = Path(entry.get("path", ""))
+        if fpath.exists():
+            try:
+                fpath.unlink()
+            except Exception:
+                pass
+
+
+def _calc_cache_size(index: dict) -> int:
+    """Return total bytes of cached audio files."""
+    total = 0
+    for entry in index.values():
+        fpath = Path(entry.get("path", ""))
+        if fpath.exists():
+            total += fpath.stat().st_size
+    return total
+
+
+# Load settings & run initial cleanup on startup
+_load_yt_cache_settings()
+_cleanup_yt_cache()
 
 
 def _find_yt_dlp():
@@ -2006,6 +2129,71 @@ def _find_yt_dlp():
         pass
     return None
 
+
+# ── YouTube cache settings API ────────────────────────────────────────────────
+
+@app.get("/api/settings/yt-cache")
+async def get_yt_cache_settings():
+    """Return current YouTube cache settings and usage stats."""
+    index = _load_cache_index()
+    total_bytes = _calc_cache_size(index)
+    return {
+        "cache_dir": _yt_cache_settings["cache_dir"],
+        "max_size_mb": _yt_cache_settings["max_size_mb"],
+        "max_items": _yt_cache_settings["max_items"],
+        "max_age_days": _yt_cache_settings["max_age_days"],
+        "current_items": len(index),
+        "current_size_mb": round(total_bytes / (1024 * 1024), 2),
+    }
+
+
+@app.post("/api/settings/yt-cache")
+async def update_yt_cache_settings(
+    cache_dir: Optional[str] = Form(None),
+    max_size_mb: Optional[int] = Form(None),
+):
+    """Update YouTube cache settings."""
+    if cache_dir is not None:
+        cache_dir = cache_dir.strip()
+        if cache_dir:
+            new_dir = Path(cache_dir)
+            new_dir.mkdir(parents=True, exist_ok=True)
+            # Move existing cache files to new location if different
+            old_dir = _get_cache_dir()
+            if str(new_dir.resolve()) != str(old_dir.resolve()):
+                index = _load_cache_index()
+                for fid, entry in index.items():
+                    old_path = Path(entry["path"])
+                    if old_path.exists():
+                        new_path = new_dir / old_path.name
+                        shutil.move(str(old_path), str(new_path))
+                        entry["path"] = str(new_path)
+                # Move index file
+                old_idx = old_dir / _YT_CACHE_INDEX
+                if old_idx.exists():
+                    old_idx.unlink()
+                _yt_cache_settings["cache_dir"] = str(new_dir)
+                _save_cache_index(index)
+
+    if max_size_mb is not None and max_size_mb > 0:
+        _yt_cache_settings["max_size_mb"] = max_size_mb
+
+    _save_yt_cache_settings()
+    _cleanup_yt_cache()
+    return await get_yt_cache_settings()
+
+
+@app.delete("/api/settings/yt-cache")
+async def clear_yt_cache():
+    """Delete all cached YouTube files."""
+    index = _load_cache_index()
+    for fid in list(index.keys()):
+        _delete_cache_entry(index, fid)
+    _save_cache_index(index)
+    return {"status": "cleared"}
+
+
+# ── YouTube fetch & download API ──────────────────────────────────────────────
 
 @app.get("/api/youtube/fetch")
 async def youtube_fetch_stream(url: str = ""):
@@ -2050,8 +2238,10 @@ async def youtube_fetch_stream(url: str = ""):
             # Phase 2: Download
             yield send_event("phase", {"phase": "downloading"})
 
-            tmp_dir = tempfile.gettempdir()
+            cache_dir = _get_cache_dir()
             safe_title = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', video_title).strip() or "youtube_audio"
+            # Download to a temp dir first, then move to cache
+            tmp_dir = tempfile.gettempdir()
             out_template = os.path.join(tmp_dir, f"{safe_title}.%(ext)s")
 
             dl_proc = await asyncio.create_subprocess_exec(
@@ -2078,7 +2268,7 @@ async def youtube_fetch_stream(url: str = ""):
                 yield send_event("error", {"message": stderr_out.decode(errors="replace") or "yt-dlp failed"})
                 return
 
-            # Phase 3: Find output file
+            # Phase 3: Find output file and move to persistent cache
             yield send_event("phase", {"phase": "processing"})
 
             out_path = None
@@ -2092,19 +2282,30 @@ async def youtube_fetch_stream(url: str = ""):
                 yield send_event("error", {"message": "yt-dlp did not produce an output file"})
                 return
 
+            # Move file into persistent cache directory
             file_id = uuid.uuid4().hex[:12]
-            _yt_temp_files[file_id] = {
-                "path": out_path,
-                "filename": os.path.basename(out_path),
+            filename = os.path.basename(out_path)
+            cached_path = str(_cache_entry_path(file_id, filename))
+            shutil.move(out_path, cached_path)
+
+            # Update cache index
+            index = _load_cache_index()
+            index[file_id] = {
+                "path": cached_path,
+                "filename": filename,
                 "title": video_title,
-                "created": asyncio.get_event_loop().time(),
+                "created": _time.time(),
                 "url": url,
                 "thumbnail": video_thumbnail,
             }
+            _save_cache_index(index)
+
+            # Enforce cache limits (evict oldest if needed)
+            _cleanup_yt_cache()
 
             yield send_event("done", {
                 "fileId": file_id,
-                "fileName": os.path.basename(out_path),
+                "fileName": filename,
                 "title": video_title,
                 "durationSeconds": video_duration,
                 "thumbnail": video_thumbnail,
@@ -2123,7 +2324,8 @@ async def youtube_fetch_stream(url: str = ""):
 @app.get("/api/youtube/download/{file_id}")
 async def youtube_download(file_id: str):
     """Download a previously fetched YouTube audio file."""
-    entry = _yt_temp_files.get(file_id)
+    index = _load_cache_index()
+    entry = index.get(file_id)
     if not entry or not os.path.exists(entry["path"]):
         return JSONResponse(status_code=404, content={"error": "File not found or expired"})
 
@@ -2133,9 +2335,11 @@ async def youtube_download(file_id: str):
 @app.get("/api/youtube/cache")
 async def youtube_cache_list():
     """Return list of cached YouTube downloads that still have files on disk."""
+    _cleanup_yt_cache()
+    index = _load_cache_index()
     items = []
-    for file_id, entry in list(_yt_temp_files.items()):
-        if os.path.exists(entry["path"]):
+    for file_id, entry in index.items():
+        if os.path.exists(entry.get("path", "")):
             items.append({
                 "fileId": file_id,
                 "url": entry.get("url", ""),
@@ -2152,8 +2356,9 @@ async def youtube_cache_lookup(url: str = ""):
     url = url.strip()
     if not url:
         return JSONResponse(status_code=400, content={"error": "URL is required"})
-    for file_id, entry in _yt_temp_files.items():
-        if entry.get("url") == url and os.path.exists(entry["path"]):
+    index = _load_cache_index()
+    for file_id, entry in index.items():
+        if entry.get("url") == url and os.path.exists(entry.get("path", "")):
             return {
                 "fileId": file_id,
                 "fileName": entry.get("filename", ""),

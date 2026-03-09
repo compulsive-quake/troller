@@ -58,6 +58,52 @@ async function toggleCuda() {
   cudaToggling.value = false;
 }
 
+// ── YouTube cache settings ─────────────────────────────────────────────────
+const ytCacheDir = ref("");
+const ytCacheMaxSizeMb = ref(128);
+const ytCacheCurrentItems = ref(0);
+const ytCacheCurrentSizeMb = ref(0);
+const ytCacheMaxItems = ref(10);
+const ytCacheMaxAgeDays = ref(7);
+const ytCacheSaving = ref(false);
+const ytCacheClearing = ref(false);
+
+async function fetchYtCacheSettings() {
+  try {
+    const resp = await fetch("http://127.0.0.1:8765/api/settings/yt-cache");
+    const data = await resp.json();
+    ytCacheDir.value = data.cache_dir;
+    ytCacheMaxSizeMb.value = data.max_size_mb;
+    ytCacheCurrentItems.value = data.current_items;
+    ytCacheCurrentSizeMb.value = data.current_size_mb;
+    ytCacheMaxItems.value = data.max_items;
+    ytCacheMaxAgeDays.value = data.max_age_days;
+  } catch { /* ignore */ }
+}
+
+async function saveYtCacheSettings() {
+  ytCacheSaving.value = true;
+  try {
+    const form = new FormData();
+    form.append("cache_dir", ytCacheDir.value);
+    form.append("max_size_mb", String(ytCacheMaxSizeMb.value));
+    const resp = await fetch("http://127.0.0.1:8765/api/settings/yt-cache", { method: "POST", body: form });
+    const data = await resp.json();
+    ytCacheCurrentItems.value = data.current_items;
+    ytCacheCurrentSizeMb.value = data.current_size_mb;
+  } catch { /* ignore */ }
+  ytCacheSaving.value = false;
+}
+
+async function clearYtCache() {
+  ytCacheClearing.value = true;
+  try {
+    await fetch("http://127.0.0.1:8765/api/settings/yt-cache", { method: "DELETE" });
+    await fetchYtCacheSettings();
+  } catch { /* ignore */ }
+  ytCacheClearing.value = false;
+}
+
 async function installCuda() {
   cudaInstalling.value = true;
   cudaInstallStage.value = "downloading";
@@ -168,6 +214,7 @@ async function installSeedVC() {
 onMounted(() => {
   checkStatus();
   fetchCudaSettings();
+  fetchYtCacheSettings();
 });
 </script>
 
@@ -292,6 +339,67 @@ onMounted(() => {
       <div v-else class="installed-badge">Installed</div>
 
       <div v-if="installLog" ref="logEl" class="install-log">{{ installLog }}</div>
+    </div>
+
+    <div class="card">
+      <h2>YouTube Cache</h2>
+      <p class="card-desc">
+        Downloaded YouTube audio files are cached on disk. Old or excess files are auto-deleted.
+      </p>
+
+      <div class="yt-cache-stats">
+        <div class="status-item">
+          <span class="status-label">Cached Items</span>
+          <span class="status-value">{{ ytCacheCurrentItems }} / {{ ytCacheMaxItems }}</span>
+        </div>
+        <div class="status-item">
+          <span class="status-label">Cache Size</span>
+          <span class="status-value">{{ ytCacheCurrentSizeMb }} MB / {{ ytCacheMaxSizeMb }} MB</span>
+        </div>
+        <div class="status-item">
+          <span class="status-label">Auto-Delete After</span>
+          <span class="status-value">{{ ytCacheMaxAgeDays }} days</span>
+        </div>
+      </div>
+
+      <div class="yt-cache-fields">
+        <label class="field-label">
+          Cache Location
+          <input
+            type="text"
+            v-model="ytCacheDir"
+            class="field-input"
+            placeholder="Path to cache directory"
+          />
+        </label>
+        <label class="field-label">
+          Max Cache Size (MB)
+          <input
+            type="number"
+            v-model.number="ytCacheMaxSizeMb"
+            class="field-input field-input-short"
+            min="1"
+            max="10240"
+          />
+        </label>
+      </div>
+
+      <div class="yt-cache-actions">
+        <button
+          class="btn-primary"
+          :disabled="ytCacheSaving"
+          @click="saveYtCacheSettings"
+        >
+          {{ ytCacheSaving ? "Saving..." : "Save Settings" }}
+        </button>
+        <button
+          class="btn-danger"
+          :disabled="ytCacheClearing || ytCacheCurrentItems === 0"
+          @click="clearYtCache"
+        >
+          {{ ytCacheClearing ? "Clearing..." : "Clear Cache" }}
+        </button>
+      </div>
     </div>
 
     <div class="card">
@@ -557,5 +665,73 @@ onMounted(() => {
 
 .btn-cuda-recheck:hover {
   opacity: 0.85;
+}
+
+.yt-cache-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.yt-cache-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.field-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.field-input {
+  padding: 8px 12px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: "Cascadia Code", "Fira Code", monospace;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.field-input:focus {
+  border-color: var(--accent);
+}
+
+.field-input-short {
+  max-width: 120px;
+}
+
+.yt-cache-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.btn-danger {
+  padding: 8px 20px;
+  background: var(--danger, #ff6b6b);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.btn-danger:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.btn-danger:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 </style>

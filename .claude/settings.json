@@ -5,7 +5,24 @@
       "WebFetch",
       "WebFetch(domain:docs.aihub.gg)",
       "WebFetch(domain:kennethmlamar.com)",
-      "Bash(npx vue-tsc --noEmit --pretty)"
+      "Bash(npx vue-tsc --noEmit --pretty)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''backend/server.py''\\).read\\(\\)\\); print\\(''server.py syntax OK''\\)\")",
+      "Bash(pip show chatterbox-tts)",
+      "Bash(pip show chatterbox_tts)",
+      "Bash(pip show chatterbox)",
+      "Bash(pip list)",
+      "Bash(python -c \"import importlib.metadata; print\\(importlib.metadata.version\\(''chatterbox-tts''\\)\\)\")",
+      "Bash(python -c \"import importlib.metadata; print\\(importlib.metadata.version\\(''chatterbox_tts''\\)\\)\")",
+      "Bash(python -c \"import importlib.metadata; print\\(importlib.metadata.version\\(''chatterbox''\\)\\)\")",
+      "Bash(python -c \"from chatterbox.tts import ChatterboxTTS; print\\(''import works''\\)\")",
+      "Bash(pip install \"chatterbox-tts==0.1.3\" --dry-run)",
+      "Bash(pip index versions chatterbox-tts)",
+      "Bash(pip install \"chatterbox-tts==\")",
+      "Bash(pip install pkuseg==0.0.25 --no-build-isolation --dry-run)",
+      "Bash(pip install \"protobuf>=5.29.5\")",
+      "Bash(pip show descript-audiotools)",
+      "Bash(python -c \"import importlib.metadata; dist = importlib.metadata.metadata\\(''descript-audiotools''\\); [print\\(r\\) for r in importlib.metadata.requires\\(''descript-audiotools''\\) if ''protobuf'' in r.lower\\(\\)]\")",
+      "Bash(pip install \"descript-audiotools>=0.7.2\" --dry-run)"
     ]
   }
 }

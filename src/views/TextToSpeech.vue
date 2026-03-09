@@ -5,15 +5,12 @@ defineProps<{ backendReady: boolean }>();
 
 const text = ref("");
 const selectedReference = ref("");
-const selectedModel = ref("seed-uvit-whisper-small-wavenet");
-const ttsVoice = ref("en-US-GuyNeural");
-const speed = ref(1.0);
-const diffusionSteps = ref(25);
+const exaggeration = ref(0.5);
+const cfgWeight = ref(0.5);
 const generating = ref(false);
 const resultUrl = ref("");
 const error = ref("");
 const references = ref<{ id: string; filename: string }[]>([]);
-const models = ref<{ id: string; name: string; type: string; version: string }[]>([]);
 
 // Progress state
 const progress = ref(0);
@@ -56,35 +53,11 @@ const utilizationColor = computed(() => {
   return 'var(--accent)';
 });
 
-const ttsVoices = [
-  { id: "en-US-GuyNeural", label: "Guy (US Male)" },
-  { id: "en-US-JennyNeural", label: "Jenny (US Female)" },
-  { id: "en-US-AriaNeural", label: "Aria (US Female)" },
-  { id: "en-US-DavisNeural", label: "Davis (US Male)" },
-  { id: "en-GB-RyanNeural", label: "Ryan (UK Male)" },
-  { id: "en-GB-SoniaNeural", label: "Sonia (UK Female)" },
-  { id: "en-AU-WilliamNeural", label: "William (AU Male)" },
-  { id: "en-AU-NatashaNeural", label: "Natasha (AU Female)" },
-  { id: "es-ES-AlvaroNeural", label: "Alvaro (Spanish Male)" },
-  { id: "fr-FR-HenriNeural", label: "Henri (French Male)" },
-  { id: "de-DE-ConradNeural", label: "Conrad (German Male)" },
-  { id: "ja-JP-KeitaNeural", label: "Keita (Japanese Male)" },
-  { id: "zh-CN-YunxiNeural", label: "Yunxi (Chinese Male)" },
-];
-
 async function loadReferences() {
   try {
     const resp = await fetch("http://127.0.0.1:8765/api/references");
     const data = await resp.json();
     references.value = data.references;
-  } catch { /* ignore */ }
-}
-
-async function loadModels() {
-  try {
-    const resp = await fetch("http://127.0.0.1:8765/api/models");
-    const data = await resp.json();
-    models.value = data.models;
   } catch { /* ignore */ }
 }
 
@@ -113,10 +86,8 @@ async function generate() {
   const formData = new FormData();
   formData.append("text", text.value);
   formData.append("reference_id", selectedReference.value);
-  formData.append("model_id", selectedModel.value);
-  formData.append("tts_voice", ttsVoice.value);
-  formData.append("speed", speed.value.toString());
-  formData.append("diffusion_steps", diffusionSteps.value.toString());
+  formData.append("exaggeration", exaggeration.value.toString());
+  formData.append("cfg_weight", cfgWeight.value.toString());
 
   try {
     const resp = await fetch("http://127.0.0.1:8765/api/tts", {
@@ -211,7 +182,6 @@ function downloadResult() {
 onBeforeUnmount(stopPolling);
 
 loadReferences();
-loadModels();
 </script>
 
 <template>
@@ -233,18 +203,6 @@ loadModels();
           <small class="hint">{{ text.length }} characters</small>
         </div>
 
-        <div class="form-group">
-          <label>Base TTS Voice</label>
-          <select v-model="ttsVoice">
-            <option v-for="v in ttsVoices" :key="v.id" :value="v.id">{{ v.label }}</option>
-          </select>
-          <small class="hint">The starting voice before conversion to your reference</small>
-        </div>
-
-        <div class="form-group">
-          <label>Speed: {{ speed.toFixed(1) }}x</label>
-          <input type="range" min="0.5" max="2.0" step="0.1" v-model.number="speed" />
-        </div>
       </div>
 
       <div class="card">
@@ -255,20 +213,19 @@ loadModels();
             <option value="" disabled>Select reference voice...</option>
             <option v-for="r in references" :key="r.id" :value="r.id">{{ r.filename }}</option>
           </select>
-          <small class="hint">The target voice to clone</small>
+          <small class="hint">The voice to clone (upload in Models tab)</small>
         </div>
 
         <div class="form-group">
-          <label>Model</label>
-          <select v-model="selectedModel">
-            <option v-for="m in models" :key="m.id" :value="m.id">{{ m.name }}</option>
-          </select>
+          <label>Exaggeration: {{ exaggeration.toFixed(2) }}</label>
+          <input type="range" min="0" max="1" step="0.05" v-model.number="exaggeration" />
+          <small class="hint">Controls expressiveness — higher = more dramatic</small>
         </div>
 
         <div class="form-group">
-          <label>Diffusion Steps: {{ diffusionSteps }}</label>
-          <input type="range" min="4" max="50" v-model.number="diffusionSteps" />
-          <small class="hint">Lower = faster, Higher = better quality</small>
+          <label>Voice Similarity: {{ cfgWeight.toFixed(2) }}</label>
+          <input type="range" min="0" max="1" step="0.05" v-model.number="cfgWeight" />
+          <small class="hint">How closely to match the reference voice</small>
         </div>
 
         <button
@@ -301,17 +258,17 @@ loadModels();
       </div>
 
       <div class="progress-steps">
-        <div :class="['step', { active: progress >= 1, done: progress >= 15 }]">
+        <div :class="['step', { active: progress >= 1, done: progress >= 20 }]">
           <span class="step-dot"></span>
-          <span>Text to Speech</span>
+          <span>Loading Model</span>
         </div>
-        <div :class="['step', { active: progress >= 15, done: progress >= 88 }]">
+        <div :class="['step', { active: progress >= 20, done: progress >= 90 }]">
           <span class="step-dot"></span>
-          <span>GPU Inference</span>
+          <span>Generating Speech</span>
         </div>
-        <div :class="['step', { active: progress >= 88, done: progress >= 100 }]">
+        <div :class="['step', { active: progress >= 90, done: progress >= 100 }]">
           <span class="step-dot"></span>
-          <span>Finalizing</span>
+          <span>Saving Output</span>
         </div>
       </div>
 

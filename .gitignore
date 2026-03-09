@@ -36,3 +36,5 @@ references
 output
 training_data
 checkpoints
+yt_cache
+backend/yt_cache_settings.json
